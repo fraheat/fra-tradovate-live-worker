@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: fra-tradovate-live-sync
+    runtime: docker
+    plan: starter
+    autoDeploy: false
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: FRA_LIVE_SYNC_WORKER_SECRET
+        sync: false

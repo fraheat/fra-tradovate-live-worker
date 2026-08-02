@@ -1,0 +1,17 @@
+{
+  "name": "fra-prop-hq-tradovate-live-worker",
+  "version": "7.7.2",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "check": "node --check src/index.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.57.4",
+    "ws": "^8.18.3"
+  }
+}
