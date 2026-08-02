@@ -17,6 +17,7 @@ const TARGET_REFRESH_MS = Number(process.env.TARGET_REFRESH_MS || 30000);
 const PULSE_MIN_INTERVAL_MS = Number(process.env.PULSE_MIN_INTERVAL_MS || 2500);
 const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 15000);
 const INSTANCE_ID = `${os.hostname()}-${process.pid}-${crypto.randomBytes(3).toString("hex")}`;
+const VERSION = "7.7.4";
 
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
@@ -49,11 +50,16 @@ async function requestWorkerSession(connectionId) {
   const accountIds = Array.isArray(payload.account_ids)
     ? payload.account_ids.map(Number).filter(Number.isFinite)
     : [];
+  const userIds = Array.isArray(payload.user_ids)
+    ? payload.user_ids.map(Number).filter(Number.isFinite)
+    : [];
   if (!token) throw new Error("Supabase did not return a Tradovate access token");
   if (!accountIds.length) throw new Error("Tradovate returned no accounts for live sync");
+  if (!userIds.length) throw new Error("Tradovate returned no user IDs for live sync");
   return {
     token,
     accountIds,
+    userIds,
     environment: payload.environment === "live" ? "live" : "demo",
     wsUrl: asText(payload.websocket_url).trim(),
   };
@@ -115,6 +121,15 @@ function sendRequest(ws, endpoint, id, body) {
   ws.send(payload);
 }
 
+function frameError(frame, fallback) {
+  const detail = frame?.d;
+  if (typeof detail === "string" && detail.trim()) return detail.trim();
+  if (detail && typeof detail === "object") {
+    return asText(detail.errorText || detail.error || detail.message || fallback);
+  }
+  return fallback;
+}
+
 function unpackFrame(rawValue) {
   const raw = asText(rawValue);
   if (!raw || raw === "o" || raw === "h") return [];
@@ -157,7 +172,12 @@ class LiveSession {
       } catch (error) {
         if (this.stopped || stopping) break;
         const message = error instanceof Error ? error.message : String(error);
-        console.error("live connection failed", this.connection.id, message);
+        console.error("live connection failed", {
+          connection_id: this.connection.id,
+          display_name: this.connection.display_name || "Tradovate login",
+          environment: this.connection.environment || "demo",
+          error: message,
+        });
         this.reconnectCount += 1;
         await writeStatus(this.connection, {
           state: "reconnecting",
@@ -176,7 +196,9 @@ class LiveSession {
   }
 
   async connectOnce() {
-    const { token, accountIds, environment, wsUrl: brokeredWsUrl } = await this.loadCredential();
+    this.authorized = false;
+    this.subscribed = false;
+    const { token, accountIds, userIds, environment, wsUrl: brokeredWsUrl } = await this.loadCredential();
     const wsUrl = brokeredWsUrl || `wss://${environment}.tradovateapi.com/v1/websocket`;
 
     await writeStatus(this.connection, {
@@ -192,7 +214,11 @@ class LiveSession {
       let settled = false;
 
       const finishReject = error => {
-        if (!settled) { settled = true; reject(error); }
+        if (!settled) {
+          settled = true;
+          try { ws.close(1011, "connection-failed"); } catch {}
+          reject(error);
+        }
       };
 
       ws.on("open", () => sendRequest(ws, "authorize", 0, token));
@@ -201,13 +227,15 @@ class LiveSession {
         if (!frames.length) return;
         for (const frame of frames) {
           if (Number(frame.i) === 0) {
-            if (Number(frame.s) !== 200) return finishReject(new Error(frame.d?.errorText || frame.d?.error || "Tradovate WebSocket authorization failed"));
+            if (Number(frame.s) !== 200) {
+              return finishReject(new Error(`websocket authorize: ${frameError(frame, "Tradovate WebSocket authorization failed")}`));
+            }
             this.authorized = true;
-            sendRequest(ws, "user/syncrequest", 1, { accounts: accountIds, splitResponses: true });
+            sendRequest(ws, "user/syncrequest", 1, { users: userIds, accounts: accountIds, splitResponses: true });
             continue;
           }
           if (Number(frame.i) === 1 && Number(frame.s) >= 400) {
-            return finishReject(new Error(frame.d?.errorText || frame.d?.error || "Tradovate user synchronization failed"));
+            return finishReject(new Error(`user/syncrequest: ${frameError(frame, "Tradovate user synchronization failed")}`));
           }
           if (Number(frame.i) === 1 && Number(frame.s) === 200 && !this.subscribed) {
             this.subscribed = true;
@@ -365,7 +393,9 @@ async function reconcileTargets() {
     session.start().catch(error => console.error("session stopped unexpectedly", target.id, error));
   }
 
-  console.log(`[${nowIso()}] live targets=${targets.length} active sessions=${sessions.size}`);
+  const liveCount = [...sessions.values()].filter(session => session.subscribed && session.ws?.readyState === WebSocket.OPEN).length;
+  const connectingCount = Math.max(sessions.size - liveCount, 0);
+  console.log(`[${nowIso()}] live targets=${targets.length} subscribed=${liveCount} connecting=${connectingCount}`);
 }
 
 async function shutdown(signal) {
@@ -381,7 +411,7 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("unhandledRejection", error => console.error("unhandled rejection", error));
 process.on("uncaughtException", error => console.error("uncaught exception", error));
 
-console.log(`FRA Prop HQ Tradovate live worker v7.7.3 starting as ${INSTANCE_ID}`);
+console.log(`FRA Prop HQ Tradovate live worker v${VERSION} starting as ${INSTANCE_ID}`);
 await reconcileTargets();
 while (!stopping) {
   await sleep(TARGET_REFRESH_MS);
