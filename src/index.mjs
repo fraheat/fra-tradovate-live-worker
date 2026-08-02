@@ -17,7 +17,7 @@ const TARGET_REFRESH_MS = Number(process.env.TARGET_REFRESH_MS || 30000);
 const PULSE_MIN_INTERVAL_MS = Number(process.env.PULSE_MIN_INTERVAL_MS || 2500);
 const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 15000);
 const INSTANCE_ID = `${os.hostname()}-${process.pid}-${crypto.randomBytes(3).toString("hex")}`;
-const VERSION = "7.7.4";
+const VERSION = "7.7.5";
 
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
@@ -47,18 +47,13 @@ async function requestWorkerSession(connectionId) {
     throw new Error(payload?.error || `Unable to obtain Tradovate live session (${response.status})`);
   }
   const token = asText(payload.access_token).trim();
-  const accountIds = Array.isArray(payload.account_ids)
-    ? payload.account_ids.map(Number).filter(Number.isFinite)
-    : [];
   const userIds = Array.isArray(payload.user_ids)
     ? payload.user_ids.map(Number).filter(Number.isFinite)
     : [];
   if (!token) throw new Error("Supabase did not return a Tradovate access token");
-  if (!accountIds.length) throw new Error("Tradovate returned no accounts for live sync");
   if (!userIds.length) throw new Error("Tradovate returned no user IDs for live sync");
   return {
     token,
-    accountIds,
     userIds,
     environment: payload.environment === "live" ? "live" : "demo",
     wsUrl: asText(payload.websocket_url).trim(),
@@ -198,7 +193,7 @@ class LiveSession {
   async connectOnce() {
     this.authorized = false;
     this.subscribed = false;
-    const { token, accountIds, userIds, environment, wsUrl: brokeredWsUrl } = await this.loadCredential();
+    const { token, userIds, environment, wsUrl: brokeredWsUrl } = await this.loadCredential();
     const wsUrl = brokeredWsUrl || `wss://${environment}.tradovateapi.com/v1/websocket`;
 
     await writeStatus(this.connection, {
@@ -231,7 +226,7 @@ class LiveSession {
               return finishReject(new Error(`websocket authorize: ${frameError(frame, "Tradovate WebSocket authorization failed")}`));
             }
             this.authorized = true;
-            sendRequest(ws, "user/syncrequest", 1, { users: userIds, accounts: accountIds, splitResponses: true });
+            sendRequest(ws, "user/syncrequest", 1, { users: userIds, splitResponses: true });
             continue;
           }
           if (Number(frame.i) === 1 && Number(frame.s) >= 400) {

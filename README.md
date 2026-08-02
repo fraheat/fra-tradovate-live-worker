@@ -1,4 +1,4 @@
-# FRA Prop HQ Tradovate live worker v7.7.4
+# FRA Prop HQ Tradovate live worker v7.7.5
 
 Persistent WebSocket worker for near-real-time Tradovate updates. It opens one read-only `user/syncrequest` session per eligible connected login, reconnects automatically, and invokes the Supabase `tradovate-live-pulse` Edge Function after account/fill events. It never places, modifies, or cancels orders.
 
@@ -22,11 +22,11 @@ Deploy the included Dockerfile as a persistent background worker on Render, Rail
 The Render worker never receives `TOKEN_ENCRYPTION_KEY` and never reads encrypted provider credentials directly. The Supabase `tradovate-live-pulse` function keeps the existing encryption key inside Supabase, decrypts or renews the stored Tradovate token, and returns a short-lived live session only to a worker presenting the shared `FRA_LIVE_SYNC_WORKER_SECRET`.
 
 
-## v7.7.4
+## v7.7.5
 Uses Node.js 22 and explicitly supplies the `ws` transport to Supabase Realtime. This fixes the Node.js 20 startup crash caused by missing native WebSocket support.
 
 
-## v7.7.4
+## v7.7.5
 - Retries stale Tradovate tokens through the brokered session function.
 - Sends both user IDs and account IDs to `user/syncrequest`.
 - Logs exact WebSocket failure stages.
