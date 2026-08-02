@@ -16,8 +16,9 @@ const WORKER_SECRET = process.env.FRA_LIVE_SYNC_WORKER_SECRET;
 const TARGET_REFRESH_MS = Number(process.env.TARGET_REFRESH_MS || 30000);
 const PULSE_MIN_INTERVAL_MS = Number(process.env.PULSE_MIN_INTERVAL_MS || 2500);
 const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 15000);
+const TRADOVATE_HEARTBEAT_MS = Math.max(1000, Math.min(Number(process.env.TRADOVATE_HEARTBEAT_MS || 2000), 2400));
 const INSTANCE_ID = `${os.hostname()}-${process.pid}-${crypto.randomBytes(3).toString("hex")}`;
-const VERSION = "7.7.5";
+const VERSION = "7.7.6";
 
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
@@ -155,6 +156,9 @@ class LiveSession {
     this.pulseInFlight = false;
     this.pulseQueued = false;
     this.heartbeatTimer = null;
+    this.socketHeartbeatTimer = null;
+    this.lastClientHeartbeatAt = 0;
+    this.lastCloseInfo = "";
     this.backoffMs = 1000;
   }
 
@@ -193,6 +197,7 @@ class LiveSession {
   async connectOnce() {
     this.authorized = false;
     this.subscribed = false;
+    this.lastCloseInfo = "";
     const { token, userIds, environment, wsUrl: brokeredWsUrl } = await this.loadCredential();
     const wsUrl = brokeredWsUrl || `wss://${environment}.tradovateapi.com/v1/websocket`;
 
@@ -216,9 +221,27 @@ class LiveSession {
         }
       };
 
-      ws.on("open", () => sendRequest(ws, "authorize", 0, token));
+      const sendSocketHeartbeat = () => {
+        if (ws.readyState !== WebSocket.OPEN) return;
+        try {
+          ws.send("[]");
+          this.lastClientHeartbeatAt = Date.now();
+        } catch (error) {
+          console.error("Tradovate heartbeat send failed", this.connection.id, error instanceof Error ? error.message : String(error));
+        }
+      };
+
+      ws.on("open", () => {
+        sendRequest(ws, "authorize", 0, token);
+        this.socketHeartbeatTimer = setInterval(sendSocketHeartbeat, TRADOVATE_HEARTBEAT_MS);
+      });
       ws.on("message", async raw => {
-        const frames = unpackFrame(raw);
+        const rawText = asText(raw);
+        if (rawText === "h") {
+          if (Date.now() - this.lastClientHeartbeatAt >= 1000) sendSocketHeartbeat();
+          return;
+        }
+        const frames = unpackFrame(rawText);
         if (!frames.length) return;
         for (const frame of frames) {
           if (Number(frame.i) === 0) {
@@ -266,6 +289,7 @@ class LiveSession {
       });
       ws.on("error", finishReject);
       ws.on("close", (code, reason) => {
+        this.lastCloseInfo = `Tradovate WebSocket closed (${code}) ${asText(reason)}`.trim();
         this.clearHeartbeat();
         this.authorized = false;
         this.subscribed = false;
@@ -286,12 +310,14 @@ class LiveSession {
     });
 
     while (!this.stopped && !stopping && this.ws?.readyState === WebSocket.OPEN) await sleep(1000);
-    if (!this.stopped && !stopping) throw new Error("Tradovate WebSocket disconnected");
+    if (!this.stopped && !stopping) throw new Error(this.lastCloseInfo || "Tradovate WebSocket disconnected");
   }
 
   clearHeartbeat() {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    if (this.socketHeartbeatTimer) clearInterval(this.socketHeartbeatTimer);
     this.heartbeatTimer = null;
+    this.socketHeartbeatTimer = null;
   }
 
   schedulePulse(reason, delay = PULSE_MIN_INTERVAL_MS) {
