@@ -1,10 +1,10 @@
 {
   "name": "fra-prop-hq-tradovate-live-worker",
-  "version": "7.7.2",
+  "version": "7.7.3",
   "private": true,
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "scripts": {
     "start": "node src/index.mjs",

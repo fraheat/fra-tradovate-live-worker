@@ -20,6 +20,7 @@ const INSTANCE_ID = `${os.hostname()}-${process.pid}-${crypto.randomBytes(3).toS
 
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
+  realtime: { transport: WebSocket },
 });
 
 const sessions = new Map();
@@ -380,7 +381,7 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("unhandledRejection", error => console.error("unhandled rejection", error));
 process.on("uncaughtException", error => console.error("uncaught exception", error));
 
-console.log(`FRA Prop HQ Tradovate live worker v7.7.2 starting as ${INSTANCE_ID}`);
+console.log(`FRA Prop HQ Tradovate live worker v7.7.3 starting as ${INSTANCE_ID}`);
 await reconcileTargets();
 while (!stopping) {
   await sleep(TARGET_REFRESH_MS);
