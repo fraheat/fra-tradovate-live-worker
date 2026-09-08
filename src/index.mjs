@@ -442,7 +442,7 @@ class LiveSession {
       return;
     }
 
-    const accountSpec = asText(targetSession.accountSpec).trim();
+    const accountSpec = asText(followerAccount?.name || targetSession.accountSpec).trim();
     if (!accountSpec) {
       await supabase.from("copier_events").insert({
         owner_id: this.connection.owner_id,
@@ -648,10 +648,7 @@ class LiveSession {
     const providerTimestamp = asText(report?.timestamp).trim();
     const providerTimestampMs = providerTimestamp ? new Date(providerTimestamp).getTime() : 0;
     if (providerTimestampMs && Date.now() - providerTimestampMs > COPIER_EVENT_MAX_AGE_MS) return;
-    // Tradovate can report a fill as execType=Trade OR execType=Completed
-    // (often with ordStatus=Filled). lastQty > 0 is the key evidence that an
-    // actual execution happened. v7.7.7 only accepted execType=Trade and
-    // therefore missed normal completed fills from TradingView/Tradovate.
+
     const isFillReport = quantity >= 1 && (
       execType === "trade" ||
       execType === "completed" ||
@@ -716,6 +713,7 @@ class LiveSession {
           ? `LIVE LEADER FILL BLOCKED · ${reason}`
           : `LIVE LEADER FILL DETECTED · ${action || "Trade"} ${quantity} ${symbol || `Contract ${contractId}`}`;
         const dedupeKey = `live:${this.connection.id}:fill:${providerFillId || reportId}:group:${group.id}`;
+
         const { error: insertError } = await supabase.from("copier_events").insert({
           owner_id: this.connection.owner_id,
           group_id: group.id,
@@ -744,7 +742,9 @@ class LiveSession {
           },
           created_at: timestamp,
         });
+
         if (insertError && insertError.code !== "23505") throw insertError;
+
         if (!insertError) {
           console.log("copier leader fill detected", {
             connection_id: this.connection.id,
@@ -756,6 +756,7 @@ class LiveSession {
             symbol: symbol || null,
             report_id: reportId,
           });
+
           if (status === "success") {
             await this.routeLeaderFillToFollowers({
               group,
@@ -838,7 +839,6 @@ class LiveSession {
     }
   }
 
-
   scheduleCopierFillScan(reason = "user-event", delay = 120) {
     if (this.stopped || stopping || !this.accessToken) return;
     if (this.copierFillScanTimer) return;
@@ -863,6 +863,7 @@ class LiveSession {
       const fills = Array.isArray(fillsPayload) ? fillsPayload : [];
       const orders = Array.isArray(ordersPayload) ? ordersPayload : [];
       const ordersById = new Map(orders.map(order => [normaliseProviderId(order?.id), order]));
+
       const recent = fills
         .filter(fill => {
           const ts = new Date(asText(fill?.timestamp)).getTime();
@@ -874,12 +875,14 @@ class LiveSession {
         const fillId = normaliseProviderId(fill?.id);
         const orderId = normaliseProviderId(fill?.orderId);
         if (!fillId || !orderId) continue;
+
         const order = ordersById.get(orderId) || {};
         const providerAccountId = normaliseProviderId(fill?.accountId || order?.accountId);
         const contractId = normaliseProviderId(fill?.contractId || order?.contractId);
         const action = asText(fill?.action || order?.action).trim();
         const quantity = Math.abs(num(fill?.qty, num(fill?.quantity)));
         if (!providerAccountId || !contractId || quantity < 1) continue;
+
         await this.detectLeaderExecution({
           id: fillId,
           accountId: providerAccountId,
@@ -904,7 +907,6 @@ class LiveSession {
     }
   }
 
-
   async scanLeaderPositions(reason = "periodic-position-scan") {
     if (this.copierPositionScanInFlight || !this.accessToken || !this.subscribed) return;
     this.copierPositionScanInFlight = true;
@@ -912,10 +914,12 @@ class LiveSession {
       const positionsPayload = await tradovateGet(this.environment, "/position/list", this.accessToken);
       const positions = Array.isArray(positionsPayload) ? positionsPayload : [];
       const current = new Map();
+
       for (const row of positions) {
         const accountId = normaliseProviderId(row?.accountId);
         const contractId = normaliseProviderId(row?.contractId);
         if (!accountId || !contractId) continue;
+
         const netPos = num(row?.netPos, num(row?.netPosition, 0));
         current.set(`${accountId}:${contractId}`, {
           accountId,
@@ -925,8 +929,6 @@ class LiveSession {
         });
       }
 
-      // First snapshot is baseline only. This prevents a worker restart while a
-      // position is already open from being mistaken for a fresh leader fill.
       if (!this.copierPositionInitialized) {
         this.copierPositionSnapshot = current;
         this.copierPositionInitialized = true;
@@ -940,8 +942,18 @@ class LiveSession {
 
       const keys = new Set([...this.copierPositionSnapshot.keys(), ...current.keys()]);
       for (const key of keys) {
-        const before = this.copierPositionSnapshot.get(key) || { accountId: key.split(":")[0], contractId: key.split(":")[1], netPos: 0 };
-        const after = current.get(key) || { accountId: before.accountId, contractId: before.contractId, netPos: 0 };
+        const before = this.copierPositionSnapshot.get(key) || {
+          accountId: key.split(":")[0],
+          contractId: key.split(":")[1],
+          netPos: 0,
+        };
+
+        const after = current.get(key) || {
+          accountId: before.accountId,
+          contractId: before.contractId,
+          netPos: 0,
+        };
+
         const delta = num(after.netPos) - num(before.netPos);
         if (!delta) continue;
 
@@ -949,6 +961,7 @@ class LiveSession {
         const quantity = Math.abs(delta);
         const positionTimestamp = asText(after.raw?.timestamp).trim() || nowIso();
         const eventId = `pos-${after.accountId}-${after.contractId}-${num(before.netPos)}-${num(after.netPos)}-${Date.now()}`;
+
         this.queuePositionDeltaFallback({
           id: eventId,
           accountId: after.accountId,
@@ -980,14 +993,17 @@ class LiveSession {
     if (this.copierPositionScanInterval) clearInterval(this.copierPositionScanInterval);
     this.copierPositionInitialized = false;
     this.copierPositionSnapshot = new Map();
+
     this.scanLeaderPositions("initial-position-baseline").catch(error =>
       console.error("initial copier position scan failed", this.connection.id, error instanceof Error ? error.message : String(error))
     );
+
     this.copierPositionScanInterval = setInterval(() => {
       this.scanLeaderPositions("periodic-position-scan").catch(error =>
         console.error("periodic copier position scan failed", this.connection.id, error instanceof Error ? error.message : String(error))
       );
     }, Math.max(500, COPIER_POSITION_SCAN_MS));
+
     this.copierPositionScanInterval.unref?.();
   }
 
@@ -995,10 +1011,20 @@ class LiveSession {
     this.authorized = false;
     this.subscribed = false;
     this.lastCloseInfo = "";
-    const { token, userIds, accountIds, accountSpec, environment, wsUrl: brokeredWsUrl } = await this.loadCredential();
+
+    const {
+      token,
+      userIds,
+      accountIds,
+      accountSpec,
+      environment,
+      wsUrl: brokeredWsUrl,
+    } = await this.loadCredential();
+
     this.accessToken = token;
     this.accountSpec = accountSpec || "";
     this.environment = environment;
+
     const wsUrl = brokeredWsUrl || `wss://${environment}.tradovateapi.com/v1/websocket`;
 
     await writeStatus(this.connection, {
@@ -1016,7 +1042,9 @@ class LiveSession {
       const finishReject = error => {
         if (!settled) {
           settled = true;
-          try { ws.close(1011, "connection-failed"); } catch {}
+          try {
+            ws.close(1011, "connection-failed");
+          } catch {}
           reject(error);
         }
       };
@@ -1027,7 +1055,11 @@ class LiveSession {
           ws.send("[]");
           this.lastClientHeartbeatAt = Date.now();
         } catch (error) {
-          console.error("Tradovate heartbeat send failed", this.connection.id, error instanceof Error ? error.message : String(error));
+          console.error(
+            "Tradovate heartbeat send failed",
+            this.connection.id,
+            error instanceof Error ? error.message : String(error)
+          );
         }
       };
 
@@ -1035,20 +1067,32 @@ class LiveSession {
         sendRequest(ws, "authorize", 0, token);
         this.socketHeartbeatTimer = setInterval(sendSocketHeartbeat, TRADOVATE_HEARTBEAT_MS);
       });
+
       ws.on("message", async raw => {
         const rawText = asText(raw);
+
         if (rawText === "h") {
-          if (Date.now() - this.lastClientHeartbeatAt >= 1000) sendSocketHeartbeat();
+          if (Date.now() - this.lastClientHeartbeatAt >= 1000) {
+            sendSocketHeartbeat();
+          }
           return;
         }
+
         const frames = unpackFrame(rawText);
         if (!frames.length) return;
+
         for (const frame of frames) {
           if (Number(frame.i) === 0) {
             if (Number(frame.s) !== 200) {
-              return finishReject(new Error(`websocket authorize: ${frameError(frame, "Tradovate WebSocket authorization failed")}`));
+              return finishReject(
+                new Error(
+                  `websocket authorize: ${frameError(frame, "Tradovate WebSocket authorization failed")}`
+                )
+              );
             }
+
             this.authorized = true;
+
             const syncBody = accountIds?.length
               ? {
                   accounts: accountIds,
@@ -1067,16 +1111,27 @@ class LiveSession {
                     "position",
                   ],
                 }
-              : { users: userIds, splitResponses: true };
+              : {
+                  users: userIds,
+                  splitResponses: true,
+                };
+
             sendRequest(ws, "user/syncrequest", 1, syncBody);
             continue;
           }
+
           if (Number(frame.i) === 1 && Number(frame.s) >= 400) {
-            return finishReject(new Error(`user/syncrequest: ${frameError(frame, "Tradovate user synchronization failed")}`));
+            return finishReject(
+              new Error(
+                `user/syncrequest: ${frameError(frame, "Tradovate user synchronization failed")}`
+              )
+            );
           }
+
           if (Number(frame.i) === 1 && Number(frame.s) === 200 && !this.subscribed) {
             this.subscribed = true;
             this.backoffMs = 1000;
+
             await supabase.from("provider_sync_checkpoints").upsert({
               connection_id: this.connection.id,
               checkpoint_key: "copier_worker_version",
@@ -1089,7 +1144,10 @@ class LiveSession {
                 provider_order_mode: "market-isAutomated",
               },
               updated_at: nowIso(),
-            }, { onConflict: "connection_id,checkpoint_key" });
+            }, {
+              onConflict: "connection_id,checkpoint_key",
+            });
+
             await writeStatus(this.connection, {
               state: "live",
               last_connected_at: nowIso(),
@@ -1099,26 +1157,44 @@ class LiveSession {
               pulse_count: this.pulseCount,
               last_error: null,
             });
+
             this.schedulePulse("initial-live-snapshot", 350);
             this.scheduleCopierFillScan("initial-live-snapshot", 500);
             this.startCopierPositionScanner();
-            if (this.sessionRefreshTimer) clearTimeout(this.sessionRefreshTimer);
+
+            if (this.sessionRefreshTimer) {
+              clearTimeout(this.sessionRefreshTimer);
+            }
+
             this.sessionRefreshTimer = setTimeout(() => {
               if (this.ws?.readyState === WebSocket.OPEN) {
-                console.log("scheduled Tradovate token refresh reconnect", this.connection.id);
-                try { this.ws.close(1000, "scheduled-token-refresh"); } catch {}
+                console.log(
+                  "scheduled Tradovate token refresh reconnect",
+                  this.connection.id
+                );
+
+                try {
+                  this.ws.close(1000, "scheduled-token-refresh");
+                } catch {}
               }
             }, SESSION_RECONNECT_MS);
+
             this.sessionRefreshTimer.unref?.();
-            if (!settled) { settled = true; resolve(); }
+
+            if (!settled) {
+              settled = true;
+              resolve();
+            }
             continue;
           }
 
           if (this.authorized) {
             this.handleCopierFrame(frame);
             this.scheduleCopierFillScan("tradovate-user-event", 120);
+
             this.eventCount += 1;
             const eventAt = nowIso();
+
             await writeStatus(this.connection, {
               state: "live",
               last_event_at: eventAt,
@@ -1127,19 +1203,32 @@ class LiveSession {
               reconnect_count: this.reconnectCount,
               last_error: null,
             });
+
             this.schedulePulse("tradovate-user-event");
           }
         }
       });
+
       ws.on("error", finishReject);
+
       ws.on("close", (code, reason) => {
         this.lastCloseInfo = `Tradovate WebSocket closed (${code}) ${asText(reason)}`.trim();
+
         this.clearHeartbeat();
         this.authorized = false;
         this.subscribed = false;
         this.ws = null;
-        if (!this.stopped && !stopping) finishReject(new Error(`Tradovate WebSocket closed (${code}) ${asText(reason)}`.trim()));
-        else if (!settled) { settled = true; resolve(); }
+
+        if (!this.stopped && !stopping) {
+          finishReject(
+            new Error(
+              `Tradovate WebSocket closed (${code}) ${asText(reason)}`.trim()
+            )
+          );
+        } else if (!settled) {
+          settled = true;
+          resolve();
+        }
       });
 
       this.heartbeatTimer = setInterval(() => {
@@ -1153,8 +1242,19 @@ class LiveSession {
       }, HEARTBEAT_MS);
     });
 
-    while (!this.stopped && !stopping && this.ws?.readyState === WebSocket.OPEN) await sleep(1000);
-    if (!this.stopped && !stopping) throw new Error(this.lastCloseInfo || "Tradovate WebSocket disconnected");
+    while (
+      !this.stopped &&
+      !stopping &&
+      this.ws?.readyState === WebSocket.OPEN
+    ) {
+      await sleep(1000);
+    }
+
+    if (!this.stopped && !stopping) {
+      throw new Error(
+        this.lastCloseInfo || "Tradovate WebSocket disconnected"
+      );
+    }
   }
 
   clearHeartbeat() {
@@ -1163,9 +1263,14 @@ class LiveSession {
     if (this.sessionRefreshTimer) clearTimeout(this.sessionRefreshTimer);
     if (this.copierFillScanTimer) clearTimeout(this.copierFillScanTimer);
     if (this.copierPositionScanInterval) clearInterval(this.copierPositionScanInterval);
-    for (const timer of this.pendingPositionFallbacks.values()) clearTimeout(timer);
+
+    for (const timer of this.pendingPositionFallbacks.values()) {
+      clearTimeout(timer);
+    }
+
     this.pendingPositionFallbacks.clear();
     this.recentPrimaryLeaderFills.clear();
+
     this.heartbeatTimer = null;
     this.socketHeartbeatTimer = null;
     this.sessionRefreshTimer = null;
@@ -1177,34 +1282,63 @@ class LiveSession {
 
   schedulePulse(reason, delay = PULSE_MIN_INTERVAL_MS) {
     if (this.stopped || stopping) return;
-    if (this.pulseTimer) clearTimeout(this.pulseTimer);
+
+    if (this.pulseTimer) {
+      clearTimeout(this.pulseTimer);
+    }
+
     const sinceLast = Date.now() - this.lastPulseAt;
-    const wait = Math.max(delay, PULSE_MIN_INTERVAL_MS - sinceLast, 0);
-    this.pulseTimer = setTimeout(() => this.runPulse(reason), wait);
+    const wait = Math.max(
+      delay,
+      PULSE_MIN_INTERVAL_MS - sinceLast,
+      0
+    );
+
+    this.pulseTimer = setTimeout(
+      () => this.runPulse(reason),
+      wait
+    );
   }
 
   async runPulse(reason) {
     this.pulseTimer = null;
+
     if (this.pulseInFlight) {
       this.pulseQueued = true;
       return;
     }
+
     this.pulseInFlight = true;
     this.lastPulseAt = Date.now();
+
     try {
-      const response = await fetch(`${SUPABASE_URL}/functions/v1/tradovate-live-pulse`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${SERVICE_ROLE_KEY}`,
-          "apikey": SERVICE_ROLE_KEY,
-          "x-fra-worker-secret": WORKER_SECRET,
-        },
-        body: JSON.stringify({ connection_id: this.connection.id, reason }),
-      });
+      const response = await fetch(
+        `${SUPABASE_URL}/functions/v1/tradovate-live-pulse`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${SERVICE_ROLE_KEY}`,
+            "apikey": SERVICE_ROLE_KEY,
+            "x-fra-worker-secret": WORKER_SECRET,
+          },
+          body: JSON.stringify({
+            connection_id: this.connection.id,
+            reason,
+          }),
+        }
+      );
+
       const payload = await response.json().catch(() => ({}));
-      if (!response.ok || payload?.error) throw new Error(payload?.error || `Live pulse failed (${response.status})`);
+
+      if (!response.ok || payload?.error) {
+        throw new Error(
+          payload?.error || `Live pulse failed (${response.status})`
+        );
+      }
+
       this.pulseCount += 1;
+
       await writeStatus(this.connection, {
         state: payload.requires_full_sync ? "attention" : "live",
         last_pulse_at: nowIso(),
@@ -1212,12 +1346,26 @@ class LiveSession {
         last_heartbeat_at: nowIso(),
         pulse_count: this.pulseCount,
         event_count: this.eventCount,
-        last_error: payload.requires_full_sync ? "A newly detected account needs one full sync" : null,
-        metadata: { last_pulse_result: payload, last_reason: reason },
+        last_error: payload.requires_full_sync
+          ? "A newly detected account needs one full sync"
+          : null,
+        metadata: {
+          last_pulse_result: payload,
+          last_reason: reason,
+        },
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.error("live pulse failed", this.connection.id, message);
+      const message =
+        error instanceof Error
+          ? error.message
+          : String(error);
+
+      console.error(
+        "live pulse failed",
+        this.connection.id,
+        message
+      );
+
       await writeStatus(this.connection, {
         state: "attention",
         last_heartbeat_at: nowIso(),
@@ -1227,33 +1375,53 @@ class LiveSession {
       });
     } finally {
       this.pulseInFlight = false;
+
       if (this.pulseQueued) {
         this.pulseQueued = false;
-        this.schedulePulse("queued-provider-event", 350);
+        this.schedulePulse(
+          "queued-provider-event",
+          350
+        );
       }
     }
   }
 
   async stop(reason = "stopped") {
     this.stopped = true;
-    if (this.pulseTimer) clearTimeout(this.pulseTimer);
+
+    if (this.pulseTimer) {
+      clearTimeout(this.pulseTimer);
+    }
+
     this.clearHeartbeat();
-    try { this.ws?.close(1000, reason); } catch {}
+
+    try {
+      this.ws?.close(1000, reason);
+    } catch {}
+
     this.ws = null;
+
     await writeStatus(this.connection, {
-      state: reason === "not-eligible" ? "manual" : "offline",
+      state: reason === "not-eligible"
+        ? "manual"
+        : "offline",
       last_heartbeat_at: nowIso(),
-      last_error: reason === "not-eligible" ? "Live sync is available on paid plans" : null,
+      last_error: reason === "not-eligible"
+        ? "Live sync is available on paid plans"
+        : null,
     });
   }
 }
 
 async function reconcileTargets() {
   const targets = await loadTargets();
-  const targetById = new Map(targets.map(row => [row.id, row]));
+  const targetById = new Map(
+    targets.map(row => [row.id, row])
+  );
 
   for (const [id, session] of sessions) {
     const target = targetById.get(id);
+
     if (!target) {
       sessions.delete(id);
       await session.stop("not-eligible");
@@ -1264,32 +1432,96 @@ async function reconcileTargets() {
 
   for (const target of targets) {
     if (sessions.has(target.id)) continue;
+
     const session = new LiveSession(target);
     sessions.set(target.id, session);
-    session.start().catch(error => console.error("session stopped unexpectedly", target.id, error));
+
+    session.start().catch(error =>
+      console.error(
+        "session stopped unexpectedly",
+        target.id,
+        error
+      )
+    );
   }
 
-  const liveCount = [...sessions.values()].filter(session => session.subscribed && session.ws?.readyState === WebSocket.OPEN).length;
-  const connectingCount = Math.max(sessions.size - liveCount, 0);
-  console.log(`[${nowIso()}] live targets=${targets.length} subscribed=${liveCount} connecting=${connectingCount}`);
+  const liveCount = [...sessions.values()]
+    .filter(
+      session =>
+        session.subscribed &&
+        session.ws?.readyState === WebSocket.OPEN
+    )
+    .length;
+
+  const connectingCount = Math.max(
+    sessions.size - liveCount,
+    0
+  );
+
+  console.log(
+    `[${nowIso()}] live targets=${targets.length} subscribed=${liveCount} connecting=${connectingCount}`
+  );
 }
 
 async function shutdown(signal) {
   if (stopping) return;
+
   stopping = true;
-  console.log(`received ${signal}; closing ${sessions.size} live sessions`);
-  await Promise.allSettled([...sessions.values()].map(session => session.stop("worker-shutdown")));
+
+  console.log(
+    `received ${signal}; closing ${sessions.size} live sessions`
+  );
+
+  await Promise.allSettled(
+    [...sessions.values()].map(
+      session => session.stop("worker-shutdown")
+    )
+  );
+
   process.exit(0);
 }
 
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
-process.on("unhandledRejection", error => console.error("unhandled rejection", error));
-process.on("uncaughtException", error => console.error("uncaught exception", error));
+process.on(
+  "SIGTERM",
+  () => shutdown("SIGTERM")
+);
 
-console.log(`FRA Prop HQ Tradovate live worker v${VERSION} starting as ${INSTANCE_ID}`);
+process.on(
+  "SIGINT",
+  () => shutdown("SIGINT")
+);
+
+process.on(
+  "unhandledRejection",
+  error => console.error(
+    "unhandled rejection",
+    error
+  )
+);
+
+process.on(
+  "uncaughtException",
+  error => console.error(
+    "uncaught exception",
+    error
+  )
+);
+
+console.log(
+  `FRA Prop HQ Tradovate live worker v${VERSION} starting as ${INSTANCE_ID}`
+);
+
 await reconcileTargets();
+
 while (!stopping) {
   await sleep(TARGET_REFRESH_MS);
-  try { await reconcileTargets(); } catch (error) { console.error("target refresh failed", error); }
+
+  try {
+    await reconcileTargets();
+  } catch (error) {
+    console.error(
+      "target refresh failed",
+      error
+    );
+  }
 }
