@@ -19,9 +19,11 @@ const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 15000);
 const TRADOVATE_HEARTBEAT_MS = Math.max(1000, Math.min(Number(process.env.TRADOVATE_HEARTBEAT_MS || 2000), 2400));
 const INSTANCE_ID = `${os.hostname()}-${process.pid}-${crypto.randomBytes(3).toString("hex")}`;
 const SESSION_RECONNECT_MS = Number(process.env.SESSION_RECONNECT_MS || 55 * 60 * 1000);
-const VERSION = "7.7.12";
+const VERSION = "7.7.15";
 const COPIER_EVENT_MAX_AGE_MS = Number(process.env.COPIER_EVENT_MAX_AGE_MS || 15 * 60 * 1000);
 const COPIER_POSITION_SCAN_MS = Number(process.env.COPIER_POSITION_SCAN_MS || 1000);
+const COPIER_POSITION_FALLBACK_GRACE_MS = Number(process.env.COPIER_POSITION_FALLBACK_GRACE_MS || 1500);
+const COPIER_PRIMARY_MATCH_WINDOW_MS = Number(process.env.COPIER_PRIMARY_MATCH_WINDOW_MS || 2000);
 
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
@@ -228,6 +230,8 @@ class LiveSession {
     this.copierPositionScanInFlight = false;
     this.copierPositionSnapshot = new Map();
     this.copierPositionInitialized = false;
+    this.recentPrimaryLeaderFills = new Map();
+    this.pendingPositionFallbacks = new Map();
   }
 
   updateConnection(connection) { this.connection = connection; }
@@ -275,6 +279,81 @@ class LiveSession {
       console.error("contract lookup failed", this.connection.id, key, error instanceof Error ? error.message : String(error));
       return "";
     }
+  }
+
+  primaryFillBucketKey(report) {
+    const accountId = normaliseProviderId(report?.accountId);
+    const contractId = normaliseProviderId(report?.contractId);
+    const action = asText(report?.action).trim().toLowerCase();
+    if (!accountId || !contractId || !action) return "";
+    return `${accountId}:${contractId}:${action}`;
+  }
+
+  rememberPrimaryLeaderFill(report) {
+    const key = this.primaryFillBucketKey(report);
+    if (!key) return;
+    const quantity = Math.abs(num(report?.lastQty));
+    if (quantity < 1) return;
+    const providerTimestampMs = new Date(asText(report?.timestamp)).getTime();
+    const observedAt = Date.now();
+    const entries = this.recentPrimaryLeaderFills.get(key) || [];
+    entries.push({
+      quantity,
+      providerTimestampMs: Number.isFinite(providerTimestampMs) ? providerTimestampMs : observedAt,
+      observedAt,
+      providerFillId: normaliseProviderId(report?.execRefId || report?.id),
+    });
+    const cutoff = observedAt - Math.max(COPIER_PRIMARY_MATCH_WINDOW_MS * 4, 10000);
+    this.recentPrimaryLeaderFills.set(key, entries.filter(entry => entry.observedAt >= cutoff));
+  }
+
+  hasPrimaryCoverageForPositionDelta(report) {
+    const key = this.primaryFillBucketKey(report);
+    if (!key) return false;
+    const requiredQuantity = Math.abs(num(report?.lastQty));
+    if (requiredQuantity < 1) return false;
+    const targetTimestampMs = new Date(asText(report?.rawPosition?.timestamp || report?.timestamp)).getTime();
+    const now = Date.now();
+    const entries = (this.recentPrimaryLeaderFills.get(key) || []).filter(entry => {
+      if (now - entry.observedAt > Math.max(COPIER_PRIMARY_MATCH_WINDOW_MS * 3, 6000)) return false;
+      if (!Number.isFinite(targetTimestampMs)) return true;
+      return Math.abs(entry.providerTimestampMs - targetTimestampMs) <= COPIER_PRIMARY_MATCH_WINDOW_MS;
+    });
+    const coveredQuantity = entries.reduce((sum, entry) => sum + Math.abs(num(entry.quantity)), 0);
+    return coveredQuantity >= requiredQuantity;
+  }
+
+  queuePositionDeltaFallback(report, eventType = "position-delta") {
+    const accountId = normaliseProviderId(report?.accountId);
+    const contractId = normaliseProviderId(report?.contractId);
+    const action = asText(report?.action).trim();
+    const quantity = Math.abs(num(report?.lastQty));
+    const before = num(report?.previousNetPos);
+    const after = num(report?.currentNetPos);
+    if (!accountId || !contractId || !action || quantity < 1) return;
+
+    const key = `${accountId}:${contractId}:${before}:${after}:${action}:${quantity}`;
+    if (this.pendingPositionFallbacks.has(key)) return;
+
+    const timer = setTimeout(async () => {
+      this.pendingPositionFallbacks.delete(key);
+      if (this.stopped || stopping) return;
+      if (this.hasPrimaryCoverageForPositionDelta(report)) {
+        console.log("copier position fallback suppressed by primary Tradovate fill", {
+          connection_id: this.connection.id,
+          provider_account_id: accountId,
+          contract_id: contractId,
+          action,
+          quantity,
+          previous_net_position: before,
+          current_net_position: after,
+        });
+        return;
+      }
+      await this.detectLeaderExecution(report, eventType);
+    }, Math.max(250, COPIER_POSITION_FALLBACK_GRACE_MS));
+    timer.unref?.();
+    this.pendingPositionFallbacks.set(key, timer);
   }
 
   async detectLeaderExecution(report, eventType) {
@@ -334,6 +413,9 @@ class LiveSession {
         .eq("armed", true);
       if (groupError) throw groupError;
       if (!groups?.length) return;
+
+      const sourceEntityType = asText(report?.sourceEntityType || eventType).trim().toLowerCase();
+      if (sourceEntityType !== "position-delta") this.rememberPrimaryLeaderFill(report);
 
       const symbol = await this.resolveContractName(contractId);
       const providerFillId = normaliseProviderId(report?.execRefId || report?.id);
@@ -577,8 +659,9 @@ class LiveSession {
 
         const action = delta > 0 ? "Buy" : "Sell";
         const quantity = Math.abs(delta);
+        const positionTimestamp = asText(after.raw?.timestamp).trim() || nowIso();
         const eventId = `pos-${after.accountId}-${after.contractId}-${num(before.netPos)}-${num(after.netPos)}-${Date.now()}`;
-        await this.detectLeaderExecution({
+        this.queuePositionDeltaFallback({
           id: eventId,
           accountId: after.accountId,
           contractId: after.contractId,
@@ -588,7 +671,7 @@ class LiveSession {
           lastQty: quantity,
           orderId: null,
           execRefId: eventId,
-          timestamp: nowIso(),
+          timestamp: positionTimestamp,
           sourceEntityType: "position-delta",
           scanReason: reason,
           previousNetPos: num(before.netPos),
@@ -705,6 +788,17 @@ class LiveSession {
           if (Number(frame.i) === 1 && Number(frame.s) === 200 && !this.subscribed) {
             this.subscribed = true;
             this.backoffMs = 1000;
+            await supabase.from("provider_sync_checkpoints").upsert({
+              connection_id: this.connection.id,
+              checkpoint_key: "copier_worker_version",
+              checkpoint_value: VERSION,
+              metadata: {
+                worker_instance: INSTANCE_ID,
+                detection_mode: "primary-fill-with-delayed-position-fallback",
+                follower_execution_enabled: false,
+              },
+              updated_at: nowIso(),
+            }, { onConflict: "connection_id,checkpoint_key" });
             await writeStatus(this.connection, {
               state: "live",
               last_connected_at: nowIso(),
@@ -778,6 +872,9 @@ class LiveSession {
     if (this.sessionRefreshTimer) clearTimeout(this.sessionRefreshTimer);
     if (this.copierFillScanTimer) clearTimeout(this.copierFillScanTimer);
     if (this.copierPositionScanInterval) clearInterval(this.copierPositionScanInterval);
+    for (const timer of this.pendingPositionFallbacks.values()) clearTimeout(timer);
+    this.pendingPositionFallbacks.clear();
+    this.recentPrimaryLeaderFills.clear();
     this.heartbeatTimer = null;
     this.socketHeartbeatTimer = null;
     this.sessionRefreshTimer = null;
