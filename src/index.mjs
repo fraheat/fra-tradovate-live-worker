@@ -19,7 +19,7 @@ const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 15000);
 const TRADOVATE_HEARTBEAT_MS = Math.max(1000, Math.min(Number(process.env.TRADOVATE_HEARTBEAT_MS || 2000), 2400));
 const INSTANCE_ID = `${os.hostname()}-${process.pid}-${crypto.randomBytes(3).toString("hex")}`;
 const SESSION_RECONNECT_MS = Number(process.env.SESSION_RECONNECT_MS || 55 * 60 * 1000);
-const VERSION = "7.7.15";
+const VERSION = "7.7.16";
 const COPIER_EVENT_MAX_AGE_MS = Number(process.env.COPIER_EVENT_MAX_AGE_MS || 15 * 60 * 1000);
 const COPIER_POSITION_SCAN_MS = Number(process.env.COPIER_POSITION_SCAN_MS || 1000);
 const COPIER_POSITION_FALLBACK_GRACE_MS = Number(process.env.COPIER_POSITION_FALLBACK_GRACE_MS || 1500);
@@ -66,6 +66,42 @@ async function tradovateGet(environment, path, token) {
   return payload;
 }
 
+async function tradovatePost(environment, path, token, body) {
+  const response = await fetch(`https://${environment}.tradovateapi.com/v1${path}`, {
+    method: "POST",
+    headers: {
+      "Accept": "application/json",
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${token}`,
+    },
+    body: JSON.stringify(body ?? {}),
+  });
+  const payload = await response.json().catch(() => ({}));
+  const failure = payload?.failureText || payload?.failureReason || payload?.errorText || payload?.error;
+  if (!response.ok || failure) {
+    throw new Error(failure || `${path} failed (${response.status})`);
+  }
+  return payload;
+}
+
+function symbolAllowed(symbol, allowedSymbols) {
+  const normalized = asText(symbol).trim().toUpperCase();
+  const allowed = Array.isArray(allowedSymbols)
+    ? allowedSymbols.map(value => asText(value).trim().toUpperCase()).filter(Boolean)
+    : [];
+  if (!allowed.length) return true;
+  if (!normalized) return false;
+  return allowed.some(value => normalized === value || normalized.startsWith(value));
+}
+
+function copierClientOrderId(groupId, followerAccountId, providerFillId) {
+  const digest = crypto.createHash("sha256")
+    .update(`${groupId}:${followerAccountId}:${providerFillId}`)
+    .digest("hex")
+    .slice(0, 28);
+  return `FRA-${digest}`;
+}
+
 async function requestWorkerSession(connectionId) {
   const response = await fetch(`${SUPABASE_URL}/functions/v1/tradovate-session`, {
     method: "POST",
@@ -110,10 +146,19 @@ async function requestWorkerSession(connectionId) {
       .filter(Number.isFinite))];
   }
 
+  let accountSpec = "";
+  try {
+    const user = await tradovateGet(environment, `/user/item?id=${encodeURIComponent(userIds[0])}`, token);
+    accountSpec = asText(user?.name).trim();
+  } catch (error) {
+    console.error("unable to resolve Tradovate accountSpec", connectionId, error instanceof Error ? error.message : String(error));
+  }
+
   return {
     token,
     userIds,
     accountIds,
+    accountSpec,
     environment,
     wsUrl: asText(payload.websocket_url).trim(),
   };
@@ -221,8 +266,10 @@ class LiveSession {
     this.lastCloseInfo = "";
     this.backoffMs = 1000;
     this.accessToken = "";
+    this.accountSpec = "";
     this.environment = "demo";
     this.contractNameCache = new Map();
+    this.followerOrderInFlight = new Set();
     this.copierEventInFlight = new Set();
     this.copierFillScanTimer = null;
     this.copierFillScanInFlight = false;
@@ -356,6 +403,240 @@ class LiveSession {
     this.pendingPositionFallbacks.set(key, timer);
   }
 
+  async getFollowerPosition(providerAccountId, contractId) {
+    try {
+      const positions = await tradovateGet(this.environment, "/position/list", this.accessToken);
+      const row = (Array.isArray(positions) ? positions : []).find(item =>
+        normaliseProviderId(item?.accountId) === normaliseProviderId(providerAccountId) &&
+        normaliseProviderId(item?.contractId) === normaliseProviderId(contractId)
+      );
+      return num(row?.netPos, num(row?.netPosition, 0));
+    } catch (error) {
+      console.error("follower position check failed", this.connection.id, providerAccountId, contractId, error instanceof Error ? error.message : String(error));
+      return null;
+    }
+  }
+
+  async executeFollowerOrder({ group, follower, followerAccount, leaderEvent, symbol, action, quantity, providerFillId, contractId }) {
+    const targetConnectionId = asText(followerAccount?.source_connection_id).trim();
+    const providerAccountId = normaliseProviderId(followerAccount?.external_id);
+    if (!targetConnectionId || !providerAccountId) return;
+
+    const targetSession = sessions.get(targetConnectionId);
+    if (!targetSession || !targetSession.accessToken || !targetSession.subscribed) {
+      await supabase.from("copier_events").insert({
+        owner_id: this.connection.owner_id,
+        group_id: group.id,
+        leader_account_id: group.leader_account_id,
+        follower_account_id: follower.account_id,
+        event_type: "follower_order_blocked",
+        status: "blocked",
+        dedupe_key: `route:${group.id}:${providerFillId}:${follower.account_id}:session-unavailable`,
+        provider_fill_id: providerFillId,
+        symbol,
+        action,
+        quantity,
+        message: `Follower blocked · ${followerAccount?.name || providerAccountId} session unavailable`,
+        payload: { reason: "follower_session_unavailable", target_connection_id: targetConnectionId },
+      });
+      return;
+    }
+
+    const accountSpec = asText(targetSession.accountSpec).trim();
+    if (!accountSpec) {
+      await supabase.from("copier_events").insert({
+        owner_id: this.connection.owner_id,
+        group_id: group.id,
+        leader_account_id: group.leader_account_id,
+        follower_account_id: follower.account_id,
+        event_type: "follower_order_blocked",
+        status: "blocked",
+        dedupe_key: `route:${group.id}:${providerFillId}:${follower.account_id}:accountspec-missing`,
+        provider_fill_id: providerFillId,
+        symbol,
+        action,
+        quantity,
+        message: `Follower blocked · Tradovate accountSpec unavailable for ${followerAccount?.name || providerAccountId}`,
+        payload: { reason: "tradovate_accountspec_missing", target_connection_id: targetConnectionId },
+      });
+      return;
+    }
+
+    const multiplier = Math.max(0, num(follower.multiplier, 1));
+    const computedQty = Math.floor(Math.abs(quantity) * multiplier + 1e-9);
+    const maxQty = Math.max(1, Math.floor(num(follower.max_qty, 1)));
+    if (computedQty < 1 || computedQty > maxQty) {
+      await supabase.from("copier_events").insert({
+        owner_id: this.connection.owner_id,
+        group_id: group.id,
+        leader_account_id: group.leader_account_id,
+        follower_account_id: follower.account_id,
+        event_type: "follower_order_blocked",
+        status: "blocked",
+        dedupe_key: `route:${group.id}:${providerFillId}:${follower.account_id}:qty-blocked`,
+        provider_fill_id: providerFillId,
+        symbol,
+        action,
+        quantity: computedQty || quantity,
+        message: `Follower blocked · computed quantity ${computedQty} exceeds limits`,
+        payload: { reason: "quantity_limit", multiplier, max_qty: maxQty, leader_quantity: quantity },
+      });
+      return;
+    }
+
+    if (!symbolAllowed(symbol, follower.allowed_symbols)) {
+      await supabase.from("copier_events").insert({
+        owner_id: this.connection.owner_id,
+        group_id: group.id,
+        leader_account_id: group.leader_account_id,
+        follower_account_id: follower.account_id,
+        event_type: "follower_order_blocked",
+        status: "blocked",
+        dedupe_key: `route:${group.id}:${providerFillId}:${follower.account_id}:symbol-blocked`,
+        provider_fill_id: providerFillId,
+        symbol,
+        action,
+        quantity: computedQty,
+        message: `Follower blocked · ${symbol} not allowed for ${followerAccount?.name || providerAccountId}`,
+        payload: { reason: "symbol_not_allowed", allowed_symbols: follower.allowed_symbols || [] },
+      });
+      return;
+    }
+
+    const dailyLossLimit = Math.abs(num(follower.max_daily_loss, 0));
+    if (dailyLossLimit > 0) {
+      const { data: accountRow } = await supabase.from("accounts")
+        .select("daily_pnl")
+        .eq("id", follower.account_id)
+        .maybeSingle();
+      if (num(accountRow?.daily_pnl, 0) <= -dailyLossLimit) {
+        await supabase.from("copier_events").insert({
+          owner_id: this.connection.owner_id,
+          group_id: group.id,
+          leader_account_id: group.leader_account_id,
+          follower_account_id: follower.account_id,
+          event_type: "follower_order_blocked",
+          status: "blocked",
+          dedupe_key: `route:${group.id}:${providerFillId}:${follower.account_id}:daily-loss`,
+          provider_fill_id: providerFillId,
+          symbol,
+          action,
+          quantity: computedQty,
+          message: `Follower blocked · daily loss limit reached on ${followerAccount?.name || providerAccountId}`,
+          payload: { reason: "daily_loss_limit", max_daily_loss: dailyLossLimit, daily_pnl: num(accountRow?.daily_pnl, 0) },
+        });
+        return;
+      }
+    }
+
+    const routeKey = `${group.id}:${follower.account_id}:${providerFillId}`;
+    if (this.followerOrderInFlight.has(routeKey)) return;
+    this.followerOrderInFlight.add(routeKey);
+
+    const clientOrderId = copierClientOrderId(group.id, follower.account_id, providerFillId);
+    const reserveDedupeKey = `route:${group.id}:${providerFillId}:${follower.account_id}:reserved`;
+    const { error: reserveError } = await supabase.from("copier_events").insert({
+      owner_id: this.connection.owner_id,
+      group_id: group.id,
+      leader_account_id: group.leader_account_id,
+      follower_account_id: follower.account_id,
+      event_type: "follower_order_reserved",
+      status: "pending",
+      dedupe_key: reserveDedupeKey,
+      provider_fill_id: providerFillId,
+      symbol,
+      action,
+      quantity: computedQty,
+      message: `Reserved → ${followerAccount?.name || providerAccountId}: ${action} ${computedQty} ${symbol}`,
+      payload: { cl_ord_id: clientOrderId, target_connection_id: targetConnectionId, target_provider_account_id: providerAccountId },
+    });
+    if (reserveError) {
+      this.followerOrderInFlight.delete(routeKey);
+      if (reserveError.code === "23505") return;
+      throw reserveError;
+    }
+
+    try {
+      const response = await tradovatePost(targetSession.environment, "/order/placeorder", targetSession.accessToken, {
+        accountSpec,
+        accountId: Number(providerAccountId),
+        clOrdId: clientOrderId,
+        action,
+        symbol,
+        orderQty: computedQty,
+        orderType: "Market",
+        isAutomated: true,
+      });
+      const providerOrderId = normaliseProviderId(response?.orderId || response?.commandId);
+      await supabase.from("copier_events").insert({
+        owner_id: this.connection.owner_id,
+        group_id: group.id,
+        leader_account_id: group.leader_account_id,
+        follower_account_id: follower.account_id,
+        event_type: "follower_order_submitted",
+        status: "success",
+        dedupe_key: `route:${group.id}:${providerFillId}:${follower.account_id}:submitted`,
+        provider_order_id: providerOrderId || null,
+        provider_fill_id: providerFillId,
+        symbol,
+        action,
+        quantity: computedQty,
+        message: `LIVE COPY → ${followerAccount?.name || providerAccountId}: ${action} ${computedQty} ${symbol}`,
+        payload: {
+          cl_ord_id: clientOrderId,
+          target_connection_id: targetConnectionId,
+          target_provider_account_id: providerAccountId,
+          provider_response: response,
+          leader_event_id: leaderEvent?.id || null,
+        },
+      });
+    } catch (error) {
+      await supabase.from("copier_events").insert({
+        owner_id: this.connection.owner_id,
+        group_id: group.id,
+        leader_account_id: group.leader_account_id,
+        follower_account_id: follower.account_id,
+        event_type: "follower_order_rejected",
+        status: "error",
+        dedupe_key: `route:${group.id}:${providerFillId}:${follower.account_id}:rejected`,
+        provider_fill_id: providerFillId,
+        symbol,
+        action,
+        quantity: computedQty,
+        message: `Follower order rejected · ${error instanceof Error ? error.message : String(error)}`,
+        payload: { cl_ord_id: clientOrderId, target_connection_id: targetConnectionId, target_provider_account_id: providerAccountId },
+      });
+    } finally {
+      setTimeout(() => this.followerOrderInFlight.delete(routeKey), 30000).unref?.();
+    }
+  }
+
+  async routeLeaderFillToFollowers({ group, leaderEvent, providerFillId, symbol, action, quantity, contractId }) {
+    if (asText(group.mode).trim().toLowerCase() !== "live" || !group.armed) return;
+    const { data: followers, error: followerError } = await supabase.from("copier_followers")
+      .select("id,group_id,owner_id,account_id,enabled,multiplier,max_qty,max_daily_loss,allowed_symbols")
+      .eq("group_id", group.id)
+      .eq("owner_id", this.connection.owner_id)
+      .eq("enabled", true);
+    if (followerError) throw followerError;
+    if (!followers?.length) return;
+
+    const followerAccountIds = followers.map(row => row.account_id).filter(Boolean);
+    const { data: followerAccounts, error: accountError } = await supabase.from("accounts")
+      .select("id,name,external_id,source_connection_id,status,is_archived")
+      .in("id", followerAccountIds);
+    if (accountError) throw accountError;
+    const accountById = new Map((followerAccounts || []).map(row => [row.id, row]));
+
+    for (const follower of followers) {
+      const followerAccount = accountById.get(follower.account_id);
+      if (!followerAccount || followerAccount.is_archived || asText(followerAccount.status).toLowerCase() !== "active") continue;
+      await this.executeFollowerOrder({
+        group, follower, followerAccount, leaderEvent, symbol, action, quantity, providerFillId, contractId,
+      });
+    }
+  }
+
   async detectLeaderExecution(report, eventType) {
     const reportId = normaliseProviderId(report?.id);
     const providerAccountId = normaliseProviderId(report?.accountId);
@@ -423,11 +704,7 @@ class LiveSession {
       const timestamp = asText(report?.timestamp).trim() || nowIso();
 
       for (const group of groups) {
-        const allowedSymbols = Array.isArray(group.allowed_symbols)
-          ? group.allowed_symbols.map(value => asText(value).trim().toUpperCase()).filter(Boolean)
-          : [];
-        const normalizedSymbol = symbol.toUpperCase();
-        const symbolBlocked = allowedSymbols.length && normalizedSymbol && !allowedSymbols.includes(normalizedSymbol);
+        const symbolBlocked = !symbolAllowed(symbol, group.allowed_symbols);
         const quantityBlocked = quantity > Math.max(1, num(group.max_leader_qty, 1));
         const status = symbolBlocked || quantityBlocked ? "blocked" : "success";
         const reason = symbolBlocked
@@ -479,6 +756,17 @@ class LiveSession {
             symbol: symbol || null,
             report_id: reportId,
           });
+          if (status === "success") {
+            await this.routeLeaderFillToFollowers({
+              group,
+              leaderEvent: { id: reportId, timestamp, source_entity_type: sourceEntityType },
+              providerFillId: providerFillId || reportId,
+              symbol: symbol || `Contract ${contractId}`,
+              action,
+              quantity,
+              contractId,
+            });
+          }
         }
       }
     } catch (error) {
@@ -707,8 +995,9 @@ class LiveSession {
     this.authorized = false;
     this.subscribed = false;
     this.lastCloseInfo = "";
-    const { token, userIds, accountIds, environment, wsUrl: brokeredWsUrl } = await this.loadCredential();
+    const { token, userIds, accountIds, accountSpec, environment, wsUrl: brokeredWsUrl } = await this.loadCredential();
     this.accessToken = token;
+    this.accountSpec = accountSpec || "";
     this.environment = environment;
     const wsUrl = brokeredWsUrl || `wss://${environment}.tradovateapi.com/v1/websocket`;
 
@@ -795,7 +1084,9 @@ class LiveSession {
               metadata: {
                 worker_instance: INSTANCE_ID,
                 detection_mode: "primary-fill-with-delayed-position-fallback",
-                follower_execution_enabled: false,
+                follower_execution_enabled: true,
+                execution_gate: "copier_groups.mode=live + armed + follower.enabled",
+                provider_order_mode: "market-isAutomated",
               },
               updated_at: nowIso(),
             }, { onConflict: "connection_id,checkpoint_key" });
