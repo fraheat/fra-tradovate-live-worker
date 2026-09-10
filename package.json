@@ -1,14 +1,14 @@
 {
   "name": "fra-prop-hq-tradovate-live-worker",
-  "version": "7.7.6",
+  "version": "7.7.21",
   "private": true,
   "type": "module",
   "engines": {
     "node": ">=22"
   },
   "scripts": {
-    "start": "node src/index.mjs",
-    "check": "node --check src/index.mjs"
+    "start": "node src/hotfix-v7.7.21.mjs",
+    "check": "node src/hotfix-v7.7.21.mjs --check-only"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.4",
