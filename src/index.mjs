@@ -19,13 +19,17 @@ const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 15000);
 const TRADOVATE_HEARTBEAT_MS = Math.max(1000, Math.min(Number(process.env.TRADOVATE_HEARTBEAT_MS || 2000), 2400));
 const INSTANCE_ID = `${os.hostname()}-${process.pid}-${crypto.randomBytes(3).toString("hex")}`;
 const SESSION_RECONNECT_MS = Number(process.env.SESSION_RECONNECT_MS || 55 * 60 * 1000);
-const VERSION = "7.7.17";
+const VERSION = "7.7.19";
 const COPIER_EVENT_MAX_AGE_MS = Number(process.env.COPIER_EVENT_MAX_AGE_MS || 15 * 60 * 1000);
 const COPIER_POSITION_SCAN_MS = Number(process.env.COPIER_POSITION_SCAN_MS || 1000);
 const COPIER_POSITION_FALLBACK_GRACE_MS = Number(process.env.COPIER_POSITION_FALLBACK_GRACE_MS || 1500);
 const COPIER_PRIMARY_MATCH_WINDOW_MS = Number(process.env.COPIER_PRIMARY_MATCH_WINDOW_MS || 2000);
-const COPIER_FILL_BURST_QUIET_MS = Math.max(100, Number(process.env.COPIER_FILL_BURST_QUIET_MS || 450));
-const COPIER_FILL_BURST_MAX_MS = Math.max(COPIER_FILL_BURST_QUIET_MS, Number(process.env.COPIER_FILL_BURST_MAX_MS || 900));
+const COPIER_PARTIAL_FILL_QUIET_MS = Math.max(75, Number(process.env.COPIER_PARTIAL_FILL_QUIET_MS || 175));
+const COPIER_PARTIAL_FILL_MAX_MS = Math.max(COPIER_PARTIAL_FILL_QUIET_MS, Number(process.env.COPIER_PARTIAL_FILL_MAX_MS || 400));
+const COPIER_REST_FALLBACK_DELAY_MS = Math.max(300, Number(process.env.COPIER_REST_FALLBACK_DELAY_MS || 750));
+const COPIER_COMMAND_POLL_MS = Math.max(100, Number(process.env.COPIER_COMMAND_POLL_MS || 200));
+const COPIER_FLATTEN_VERIFY_MS = Math.max(300, Number(process.env.COPIER_FLATTEN_VERIFY_MS || 750));
+const COPIER_FLATTEN_VERIFY_ATTEMPTS = Math.max(2, Math.min(Number(process.env.COPIER_FLATTEN_VERIFY_ATTEMPTS || 5), 10));
 
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
@@ -79,9 +83,12 @@ async function tradovatePost(environment, path, token, body) {
     body: JSON.stringify(body ?? {}),
   });
   const payload = await response.json().catch(() => ({}));
-  const failure = payload?.failureText || payload?.failureReason || payload?.errorText || payload?.error;
-  if (!response.ok || failure) {
-    throw new Error(failure || `${path} failed (${response.status})`);
+  const failureReason = asText(payload?.failureReason).trim();
+  const failureText = asText(payload?.failureText).trim();
+  const errorText = asText(payload?.errorText || payload?.error).trim();
+  const explicitFailure = payload?.ok === false || failureText || errorText || (failureReason && failureReason.toLowerCase() !== "success");
+  if (!response.ok || explicitFailure) {
+    throw new Error(failureText || errorText || failureReason || `${path} failed (${response.status})`);
   }
   return payload;
 }
@@ -271,6 +278,7 @@ class LiveSession {
     this.accountSpec = "";
     this.environment = "demo";
     this.contractNameCache = new Map();
+    this.contractNamePromiseCache = new Map();
     this.followerOrderInFlight = new Set();
     this.copierEventInFlight = new Set();
     this.copierFillScanTimer = null;
@@ -320,15 +328,30 @@ class LiveSession {
     const key = normaliseProviderId(contractId);
     if (!key) return "";
     if (this.contractNameCache.has(key)) return this.contractNameCache.get(key);
-    try {
-      const contract = await tradovateGet(this.environment, `/contract/item?id=${encodeURIComponent(key)}`, this.accessToken);
-      const name = asText(contract?.name).trim();
-      if (name) this.contractNameCache.set(key, name);
-      return name;
-    } catch (error) {
-      console.error("contract lookup failed", this.connection.id, key, error instanceof Error ? error.message : String(error));
-      return "";
-    }
+    if (this.contractNamePromiseCache.has(key)) return this.contractNamePromiseCache.get(key);
+
+    const lookup = (async () => {
+      try {
+        const contract = await tradovateGet(this.environment, `/contract/item?id=${encodeURIComponent(key)}`, this.accessToken);
+        const name = asText(contract?.name).trim();
+        if (name) this.contractNameCache.set(key, name);
+        return name;
+      } catch (error) {
+        console.error("contract lookup failed", this.connection.id, key, error instanceof Error ? error.message : String(error));
+        return "";
+      } finally {
+        this.contractNamePromiseCache.delete(key);
+      }
+    })();
+
+    this.contractNamePromiseCache.set(key, lookup);
+    return lookup;
+  }
+
+  primeContractName(contractId) {
+    const key = normaliseProviderId(contractId);
+    if (!key || this.contractNameCache.has(key) || this.contractNamePromiseCache.has(key)) return;
+    this.resolveContractName(key).catch(() => {});
   }
 
   primaryFillBucketKey(report) {
@@ -420,14 +443,81 @@ class LiveSession {
     }
   }
 
-  async executeFollowerOrder({ group, follower, followerAccount, leaderEvent, symbol, action, quantity, providerFillId, contractId }) {
+  queueCopierAudit(row, label = "copier audit") {
+    try {
+      supabase.from("copier_events").insert(row).then(({ error }) => {
+        if (error && error.code !== "23505") {
+          console.error(label, this.connection.id, error.message);
+        }
+      }).catch(error => {
+        console.error(label, this.connection.id, error instanceof Error ? error.message : String(error));
+      });
+    } catch (error) {
+      console.error(label, this.connection.id, error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async tripCopierSafety(group, providerFillId, reason, details = {}) {
+    try {
+      const { error } = await supabase.from("copier_groups").update({
+        armed: false,
+        desired_armed: false,
+        updated_at: nowIso(),
+      }).eq("id", group.id).eq("owner_id", this.connection.owner_id);
+      if (error) throw error;
+      this.queueCopierAudit({
+        owner_id: this.connection.owner_id,
+        group_id: group.id,
+        leader_account_id: group.leader_account_id,
+        event_type: "copier_safety_trip",
+        status: "error",
+        dedupe_key: `safety-trip:${group.id}:${providerFillId || "no-fill"}:${reason}`,
+        provider_fill_id: providerFillId || null,
+        message: `COPIER SAFETY TRIP · ${reason} · copier disarmed`,
+        payload: {
+          reason,
+          worker_version: VERSION,
+          worker_instance: INSTANCE_ID,
+          ...details,
+        },
+      }, "copier safety-trip audit failed");
+    } catch (error) {
+      console.error("copier safety trip failed", group?.id, error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  latencyPayload(telemetry = {}, dispatchStartedAtMs = Date.now(), responseAtMs = null) {
+    const providerTimestampMs = num(telemetry.providerTimestampMs, 0);
+    const workerReceivedAtMs = num(telemetry.workerReceivedAtMs, 0);
+    const rpcStartedAtMs = num(telemetry.rpcStartedAtMs, 0);
+    const rpcFinishedAtMs = num(telemetry.rpcFinishedAtMs, 0);
+    const out = {
+      fast_path: true,
+      worker_version: VERSION,
+      provider_timestamp: providerTimestampMs ? new Date(providerTimestampMs).toISOString() : null,
+      worker_received_at: workerReceivedAtMs ? new Date(workerReceivedAtMs).toISOString() : null,
+      dispatch_started_at: new Date(dispatchStartedAtMs).toISOString(),
+      provider_to_worker_ms: providerTimestampMs && workerReceivedAtMs ? Math.max(0, workerReceivedAtMs - providerTimestampMs) : null,
+      worker_to_dispatch_ms: workerReceivedAtMs ? Math.max(0, dispatchStartedAtMs - workerReceivedAtMs) : null,
+      provider_to_dispatch_ms: providerTimestampMs ? Math.max(0, dispatchStartedAtMs - providerTimestampMs) : null,
+      dispatch_prepare_rpc_ms: rpcStartedAtMs && rpcFinishedAtMs ? Math.max(0, rpcFinishedAtMs - rpcStartedAtMs) : null,
+    };
+    if (responseAtMs) {
+      out.provider_response_at = new Date(responseAtMs).toISOString();
+      out.order_api_ms = Math.max(0, responseAtMs - dispatchStartedAtMs);
+      out.provider_to_response_ms = providerTimestampMs ? Math.max(0, responseAtMs - providerTimestampMs) : null;
+    }
+    return out;
+  }
+
+  async executeFollowerOrder({ group, follower, followerAccount, leaderEvent, symbol, action, quantity, providerFillId, contractId, telemetry }) {
     const targetConnectionId = asText(followerAccount?.source_connection_id).trim();
     const providerAccountId = normaliseProviderId(followerAccount?.external_id);
     if (!targetConnectionId || !providerAccountId) return;
 
     const targetSession = sessions.get(targetConnectionId);
-    if (!targetSession || !targetSession.accessToken || !targetSession.subscribed) {
-      await supabase.from("copier_events").insert({
+    if (!targetSession || !targetSession.accessToken || !targetSession.subscribed || targetSession.ws?.readyState !== WebSocket.OPEN) {
+      this.queueCopierAudit({
         owner_id: this.connection.owner_id,
         group_id: group.id,
         leader_account_id: group.leader_account_id,
@@ -440,14 +530,15 @@ class LiveSession {
         action,
         quantity,
         message: `Follower blocked · ${followerAccount?.name || providerAccountId} session unavailable`,
-        payload: { reason: "follower_session_unavailable", target_connection_id: targetConnectionId },
-      });
+        payload: { reason: "follower_session_unavailable", target_connection_id: targetConnectionId, ...this.latencyPayload(telemetry) },
+      }, "copier session-block audit failed");
+      await this.tripCopierSafety(group, providerFillId, "follower_session_unavailable", { target_connection_id: targetConnectionId, follower_account_id: follower.account_id });
       return;
     }
 
     const accountSpec = asText(followerAccount?.name || targetSession.accountSpec).trim();
     if (!accountSpec) {
-      await supabase.from("copier_events").insert({
+      this.queueCopierAudit({
         owner_id: this.connection.owner_id,
         group_id: group.id,
         leader_account_id: group.leader_account_id,
@@ -460,8 +551,9 @@ class LiveSession {
         action,
         quantity,
         message: `Follower blocked · Tradovate accountSpec unavailable for ${followerAccount?.name || providerAccountId}`,
-        payload: { reason: "tradovate_accountspec_missing", target_connection_id: targetConnectionId },
-      });
+        payload: { reason: "tradovate_accountspec_missing", target_connection_id: targetConnectionId, ...this.latencyPayload(telemetry) },
+      }, "copier accountSpec audit failed");
+      await this.tripCopierSafety(group, providerFillId, "tradovate_accountspec_missing", { target_connection_id: targetConnectionId, follower_account_id: follower.account_id });
       return;
     }
 
@@ -469,7 +561,7 @@ class LiveSession {
     const computedQty = Math.floor(Math.abs(quantity) * multiplier + 1e-9);
     const maxQty = Math.max(1, Math.floor(num(follower.max_qty, 1)));
     if (computedQty < 1 || computedQty > maxQty) {
-      await supabase.from("copier_events").insert({
+      this.queueCopierAudit({
         owner_id: this.connection.owner_id,
         group_id: group.id,
         leader_account_id: group.leader_account_id,
@@ -482,13 +574,13 @@ class LiveSession {
         action,
         quantity: computedQty || quantity,
         message: `Follower blocked · computed quantity ${computedQty} exceeds limits`,
-        payload: { reason: "quantity_limit", multiplier, max_qty: maxQty, leader_quantity: quantity },
-      });
+        payload: { reason: "quantity_limit", multiplier, max_qty: maxQty, leader_quantity: quantity, ...this.latencyPayload(telemetry) },
+      }, "copier quantity-block audit failed");
       return;
     }
 
     if (!symbolAllowed(symbol, follower.allowed_symbols)) {
-      await supabase.from("copier_events").insert({
+      this.queueCopierAudit({
         owner_id: this.connection.owner_id,
         group_id: group.id,
         leader_account_id: group.leader_account_id,
@@ -501,35 +593,30 @@ class LiveSession {
         action,
         quantity: computedQty,
         message: `Follower blocked · ${symbol} not allowed for ${followerAccount?.name || providerAccountId}`,
-        payload: { reason: "symbol_not_allowed", allowed_symbols: follower.allowed_symbols || [] },
-      });
+        payload: { reason: "symbol_not_allowed", allowed_symbols: follower.allowed_symbols || [], ...this.latencyPayload(telemetry) },
+      }, "copier symbol-block audit failed");
       return;
     }
 
     const dailyLossLimit = Math.abs(num(follower.max_daily_loss, 0));
-    if (dailyLossLimit > 0) {
-      const { data: accountRow } = await supabase.from("accounts")
-        .select("daily_pnl")
-        .eq("id", follower.account_id)
-        .maybeSingle();
-      if (num(accountRow?.daily_pnl, 0) <= -dailyLossLimit) {
-        await supabase.from("copier_events").insert({
-          owner_id: this.connection.owner_id,
-          group_id: group.id,
-          leader_account_id: group.leader_account_id,
-          follower_account_id: follower.account_id,
-          event_type: "follower_order_blocked",
-          status: "blocked",
-          dedupe_key: `route:${group.id}:${providerFillId}:${follower.account_id}:daily-loss`,
-          provider_fill_id: providerFillId,
-          symbol,
-          action,
-          quantity: computedQty,
-          message: `Follower blocked · daily loss limit reached on ${followerAccount?.name || providerAccountId}`,
-          payload: { reason: "daily_loss_limit", max_daily_loss: dailyLossLimit, daily_pnl: num(accountRow?.daily_pnl, 0) },
-        });
-        return;
-      }
+    const dailyPnl = num(followerAccount?.daily_pnl, 0);
+    if (dailyLossLimit > 0 && dailyPnl <= -dailyLossLimit) {
+      this.queueCopierAudit({
+        owner_id: this.connection.owner_id,
+        group_id: group.id,
+        leader_account_id: group.leader_account_id,
+        follower_account_id: follower.account_id,
+        event_type: "follower_order_blocked",
+        status: "blocked",
+        dedupe_key: `route:${group.id}:${providerFillId}:${follower.account_id}:daily-loss`,
+        provider_fill_id: providerFillId,
+        symbol,
+        action,
+        quantity: computedQty,
+        message: `Follower blocked · daily loss limit reached on ${followerAccount?.name || providerAccountId}`,
+        payload: { reason: "daily_loss_limit", max_daily_loss: dailyLossLimit, daily_pnl: dailyPnl, ...this.latencyPayload(telemetry) },
+      }, "copier daily-loss audit failed");
+      return;
     }
 
     const routeKey = `${group.id}:${follower.account_id}:${providerFillId}`;
@@ -537,27 +624,29 @@ class LiveSession {
     this.followerOrderInFlight.add(routeKey);
 
     const clientOrderId = copierClientOrderId(group.id, follower.account_id, providerFillId);
-    const reserveDedupeKey = `route:${group.id}:${providerFillId}:${follower.account_id}:reserved`;
-    const { error: reserveError } = await supabase.from("copier_events").insert({
+    const dispatchStartedAtMs = Date.now();
+    const latency = this.latencyPayload(telemetry, dispatchStartedAtMs);
+
+    this.queueCopierAudit({
       owner_id: this.connection.owner_id,
       group_id: group.id,
       leader_account_id: group.leader_account_id,
       follower_account_id: follower.account_id,
       event_type: "follower_order_reserved",
       status: "pending",
-      dedupe_key: reserveDedupeKey,
+      dedupe_key: `route:${group.id}:${providerFillId}:${follower.account_id}:reserved`,
       provider_fill_id: providerFillId,
       symbol,
       action,
       quantity: computedQty,
       message: `Reserved → ${followerAccount?.name || providerAccountId}: ${action} ${computedQty} ${symbol}`,
-      payload: { cl_ord_id: clientOrderId, target_connection_id: targetConnectionId, target_provider_account_id: providerAccountId },
-    });
-    if (reserveError) {
-      this.followerOrderInFlight.delete(routeKey);
-      if (reserveError.code === "23505") return;
-      throw reserveError;
-    }
+      payload: {
+        cl_ord_id: clientOrderId,
+        target_connection_id: targetConnectionId,
+        target_provider_account_id: providerAccountId,
+        ...latency,
+      },
+    }, "copier reserve audit failed");
 
     try {
       const response = await tradovatePost(targetSession.environment, "/order/placeorder", targetSession.accessToken, {
@@ -570,8 +659,9 @@ class LiveSession {
         orderType: "Market",
         isAutomated: true,
       });
+      const responseAtMs = Date.now();
       const providerOrderId = normaliseProviderId(response?.orderId || response?.commandId);
-      await supabase.from("copier_events").insert({
+      this.queueCopierAudit({
         owner_id: this.connection.owner_id,
         group_id: group.id,
         leader_account_id: group.leader_account_id,
@@ -591,10 +681,12 @@ class LiveSession {
           target_provider_account_id: providerAccountId,
           provider_response: response,
           leader_event_id: leaderEvent?.id || null,
+          ...this.latencyPayload(telemetry, dispatchStartedAtMs, responseAtMs),
         },
-      });
+      }, "copier submitted audit failed");
     } catch (error) {
-      await supabase.from("copier_events").insert({
+      const responseAtMs = Date.now();
+      this.queueCopierAudit({
         owner_id: this.connection.owner_id,
         group_id: group.id,
         leader_account_id: group.leader_account_id,
@@ -607,19 +699,129 @@ class LiveSession {
         action,
         quantity: computedQty,
         message: `Follower order rejected · ${error instanceof Error ? error.message : String(error)}`,
-        payload: { cl_ord_id: clientOrderId, target_connection_id: targetConnectionId, target_provider_account_id: providerAccountId },
+        payload: {
+          cl_ord_id: clientOrderId,
+          target_connection_id: targetConnectionId,
+          target_provider_account_id: providerAccountId,
+          ...this.latencyPayload(telemetry, dispatchStartedAtMs, responseAtMs),
+        },
+      }, "copier rejected audit failed");
+      await this.tripCopierSafety(group, providerFillId, "follower_order_rejected", {
+        follower_account_id: follower.account_id,
+        follower_account_name: followerAccount?.name || providerAccountId,
+        target_connection_id: targetConnectionId,
+        error: error instanceof Error ? error.message : String(error),
       });
     } finally {
       setTimeout(() => this.followerOrderInFlight.delete(routeKey), 30000).unref?.();
     }
   }
 
-  aggregateFillId(groupId, providerOrderId, fillIds) {
+  aggregateFillId(providerOrderId, fillIds, action, symbol) {
     const digest = crypto.createHash("sha256")
-      .update(`${groupId}:${providerOrderId || "no-order"}:${[...fillIds].sort().join(",")}`)
+      .update(`${this.connection.id}:${providerOrderId || "no-order"}:${asText(action).toLowerCase()}:${asText(symbol).toUpperCase()}:${[...fillIds].sort().join(",")}`)
       .digest("hex")
       .slice(0, 28);
     return `agg-${digest}`;
+  }
+
+  async prepareAndRouteLeaderFill({ providerAccountId, providerFillId, providerOrderId, symbol, action, quantity, contractId, leaderEvent, eventType, telemetry }) {
+    if (this.stopped || stopping || !this.subscribed || this.ws?.readyState !== WebSocket.OPEN) return;
+
+    const rpcStartedAtMs = Date.now();
+    const providerTimestampMs = num(telemetry?.providerTimestampMs, 0);
+    const providerTimestamp = providerTimestampMs ? new Date(providerTimestampMs).toISOString() : (leaderEvent?.timestamp || nowIso());
+    const payload = {
+      source_entity_type: leaderEvent?.source_entity_type || null,
+      component_fill_ids: leaderEvent?.component_fill_ids || [providerFillId],
+      contract_id: contractId || null,
+      event_type: eventType || null,
+      worker_received_at: telemetry?.workerReceivedAtMs ? new Date(telemetry.workerReceivedAtMs).toISOString() : null,
+      last_price: telemetry?.lastPrice ?? null,
+      avg_price: telemetry?.avgPrice ?? null,
+      worker_version: VERSION,
+    };
+
+    const { data, error } = await supabase.rpc("prepare_live_copier_dispatch_v1", {
+      p_connection_id: this.connection.id,
+      p_owner_id: this.connection.owner_id,
+      p_provider_account_id: providerAccountId,
+      p_provider_fill_id: providerFillId,
+      p_provider_order_id: providerOrderId || null,
+      p_symbol: symbol,
+      p_action: action,
+      p_quantity: quantity,
+      p_provider_timestamp: providerTimestamp,
+      p_event_type: eventType || null,
+      p_payload: payload,
+    });
+    const rpcFinishedAtMs = Date.now();
+
+    if (error) throw error;
+    if (!data?.ok) {
+      if (data?.reason && data.reason !== "leader_account_not_mapped") {
+        console.warn("copier fast dispatch not prepared", this.connection.id, data.reason);
+      }
+      return;
+    }
+
+    const plans = Array.isArray(data.groups) ? data.groups : [];
+    if (!plans.length) return;
+
+    const fastTelemetry = {
+      ...telemetry,
+      providerTimestampMs,
+      rpcStartedAtMs,
+      rpcFinishedAtMs,
+    };
+
+    console.log("copier fast dispatch ready", {
+      connection_id: this.connection.id,
+      provider_fill_id: providerFillId,
+      provider_order_id: providerOrderId || null,
+      symbol,
+      action,
+      quantity,
+      groups: plans.length,
+      provider_to_worker_ms: providerTimestampMs && telemetry?.workerReceivedAtMs ? Math.max(0, telemetry.workerReceivedAtMs - providerTimestampMs) : null,
+      prepare_rpc_ms: rpcFinishedAtMs - rpcStartedAtMs,
+      provider_to_dispatch_ready_ms: providerTimestampMs ? Math.max(0, rpcFinishedAtMs - providerTimestampMs) : null,
+    });
+
+    const routes = [];
+    for (const plan of plans) {
+      const group = plan?.group || {};
+      const followers = Array.isArray(plan?.followers) ? plan.followers : [];
+      for (const route of followers) {
+        if (!route?.follower || !route?.account) continue;
+        routes.push({ group, follower: route.follower, followerAccount: route.account });
+      }
+    }
+
+    const startedAt = Date.now();
+    const results = await Promise.allSettled(routes.map(({ group, follower, followerAccount }) =>
+      this.executeFollowerOrder({
+        group,
+        follower,
+        followerAccount,
+        leaderEvent,
+        symbol,
+        action,
+        quantity,
+        providerFillId,
+        contractId,
+        telemetry: fastTelemetry,
+      })
+    ));
+
+    const rejected = results.filter(result => result.status === "rejected");
+    console.log("copier parallel fast-path batch complete", {
+      connection_id: this.connection.id,
+      provider_fill_id: providerFillId,
+      followers: routes.length,
+      rejected: rejected.length,
+      elapsed_ms: Date.now() - startedAt,
+    });
   }
 
   async flushLeaderFillBatch(batchKey) {
@@ -630,173 +832,141 @@ class LiveSession {
 
     if (this.stopped || stopping || !batch.fillIds.size || batch.quantity < 1) return;
 
-    const { data: currentGroup, error: groupError } = await supabase.from("copier_groups")
-      .select("id,owner_id,name,mode,armed,leader_account_id,max_leader_qty,allowed_symbols")
-      .eq("id", batch.group.id)
-      .eq("owner_id", this.connection.owner_id)
-      .maybeSingle();
-    if (groupError) throw groupError;
-    if (!currentGroup || asText(currentGroup.mode).trim().toLowerCase() !== "live" || !currentGroup.armed) return;
-
-    const aggregateProviderFillId = this.aggregateFillId(currentGroup.id, batch.providerOrderId, batch.fillIds);
+    const aggregateProviderFillId = this.aggregateFillId(batch.providerOrderId, batch.fillIds, batch.action, batch.symbol);
     const aggregateQuantity = Math.abs(num(batch.quantity));
-    const maxLeaderQty = Math.max(1, num(currentGroup.max_leader_qty, 1));
-
-    if (!symbolAllowed(batch.symbol, currentGroup.allowed_symbols) || aggregateQuantity > maxLeaderQty) {
-      const reason = !symbolAllowed(batch.symbol, currentGroup.allowed_symbols)
-        ? `${batch.symbol} is not allowed by this copier group`
-        : `Aggregated leader fill quantity ${aggregateQuantity} exceeds copier max ${maxLeaderQty}`;
-      await supabase.from("copier_events").insert({
-        owner_id: this.connection.owner_id,
-        group_id: currentGroup.id,
-        leader_account_id: currentGroup.leader_account_id,
-        event_type: "live_leader_fill_aggregate_blocked",
-        status: "blocked",
-        dedupe_key: `live:${this.connection.id}:aggregate:${aggregateProviderFillId}:blocked`,
-        provider_order_id: batch.providerOrderId || null,
-        provider_fill_id: aggregateProviderFillId,
-        symbol: batch.symbol || null,
-        action: batch.action || null,
-        quantity: aggregateQuantity,
-        message: `LIVE LEADER FILL BLOCKED · ${reason}`,
-        payload: {
-          aggregated: true,
-          leader_fill_ids: [...batch.fillIds],
-          leader_provider_order_id: batch.providerOrderId || null,
-          burst_quiet_ms: COPIER_FILL_BURST_QUIET_MS,
-          burst_max_ms: COPIER_FILL_BURST_MAX_MS,
-        },
-      });
-      return;
-    }
 
     console.log("copier leader fill batch ready", {
       connection_id: this.connection.id,
-      group_id: currentGroup.id,
       provider_order_id: batch.providerOrderId || null,
       fill_ids: [...batch.fillIds],
       action: batch.action,
       quantity: aggregateQuantity,
       symbol: batch.symbol,
+      final_fill_seen: !!batch.finalFillSeen,
       batch_age_ms: Date.now() - batch.firstSeenAt,
     });
 
-    await this.routeLeaderFillToFollowers({
-      group: currentGroup,
-      leaderEvent: {
-        id: batch.leaderEvent?.id || aggregateProviderFillId,
-        timestamp: batch.leaderEvent?.timestamp || nowIso(),
-        source_entity_type: "aggregated-primary-fill",
-        component_fill_ids: [...batch.fillIds],
-        provider_order_id: batch.providerOrderId || null,
-      },
+    await this.prepareAndRouteLeaderFill({
+      providerAccountId: batch.providerAccountId,
       providerFillId: aggregateProviderFillId,
+      providerOrderId: batch.providerOrderId,
       symbol: batch.symbol,
       action: batch.action,
       quantity: aggregateQuantity,
       contractId: batch.contractId,
+      eventType: batch.eventType,
+      leaderEvent: {
+        id: batch.leaderEvent?.id || aggregateProviderFillId,
+        timestamp: batch.providerTimestampMs ? new Date(batch.providerTimestampMs).toISOString() : (batch.leaderEvent?.timestamp || nowIso()),
+        source_entity_type: batch.leaderEvent?.source_entity_type || "aggregated-primary-fill",
+        component_fill_ids: [...batch.fillIds],
+        provider_order_id: batch.providerOrderId || null,
+      },
+      telemetry: {
+        providerTimestampMs: batch.providerTimestampMs,
+        workerReceivedAtMs: batch.workerReceivedAtMs,
+        lastPrice: batch.lastPrice,
+        avgPrice: batch.avgPrice,
+      },
     });
   }
 
-  enqueueLeaderFillBatch({ group, leaderEvent, providerFillId, providerOrderId, symbol, action, quantity, contractId }) {
+  enqueueLeaderFillBatch({ providerAccountId, leaderEvent, providerFillId, providerOrderId, symbol, action, quantity, contractId, eventType, finalFill, telemetry }) {
     if (!providerOrderId) {
-      this.routeLeaderFillToFollowers({
-        group, leaderEvent, providerFillId, symbol, action, quantity, contractId,
+      this.prepareAndRouteLeaderFill({
+        providerAccountId,
+        providerFillId,
+        providerOrderId: null,
+        symbol,
+        action,
+        quantity,
+        contractId,
+        leaderEvent,
+        eventType,
+        telemetry,
       }).catch(error => console.error("copier immediate follower route failed", this.connection.id, error instanceof Error ? error.message : String(error)));
       return;
     }
 
-    const batchKey = `${group.id}:${providerOrderId}:${asText(action).trim().toLowerCase()}:${asText(symbol).trim().toUpperCase()}`;
+    const batchKey = `${providerOrderId}:${asText(action).trim().toLowerCase()}:${asText(symbol).trim().toUpperCase()}`;
     const now = Date.now();
     let batch = this.pendingLeaderFillBatches.get(batchKey);
     if (!batch) {
       batch = {
-        group,
+        providerAccountId,
         leaderEvent,
         providerOrderId,
         symbol,
         action,
         contractId,
+        eventType,
         fillIds: new Set(),
         quantity: 0,
         firstSeenAt: now,
         lastSeenAt: now,
+        providerTimestampMs: num(telemetry?.providerTimestampMs, 0),
+        workerReceivedAtMs: num(telemetry?.workerReceivedAtMs, now),
+        lastPrice: telemetry?.lastPrice ?? null,
+        avgPrice: telemetry?.avgPrice ?? null,
+        finalFillSeen: false,
         timer: null,
       };
       this.pendingLeaderFillBatches.set(batchKey, batch);
     }
 
-    if (batch.fillIds.has(providerFillId)) return;
+    if (batch.fillIds.has(providerFillId)) {
+      if (finalFill && !batch.finalFillSeen) {
+        batch.finalFillSeen = true;
+        if (batch.timer) clearTimeout(batch.timer);
+        batch.timer = setTimeout(() => {
+          this.flushLeaderFillBatch(batchKey).catch(error =>
+            console.error("copier final fill flush failed", this.connection.id, error instanceof Error ? error.message : String(error))
+          );
+        }, 0);
+        batch.timer.unref?.();
+      }
+      return;
+    }
+
     batch.fillIds.add(providerFillId);
     batch.quantity += Math.abs(num(quantity));
     batch.lastSeenAt = now;
     batch.leaderEvent = leaderEvent || batch.leaderEvent;
+    batch.eventType = eventType || batch.eventType;
+    batch.lastPrice = telemetry?.lastPrice ?? batch.lastPrice;
+    batch.avgPrice = telemetry?.avgPrice ?? batch.avgPrice;
+    const providerTs = num(telemetry?.providerTimestampMs, 0);
+    if (providerTs && (!batch.providerTimestampMs || providerTs < batch.providerTimestampMs)) batch.providerTimestampMs = providerTs;
+    const receivedTs = num(telemetry?.workerReceivedAtMs, 0);
+    if (receivedTs && (!batch.workerReceivedAtMs || receivedTs < batch.workerReceivedAtMs)) batch.workerReceivedAtMs = receivedTs;
 
     if (batch.timer) clearTimeout(batch.timer);
+
+    if (finalFill) {
+      batch.finalFillSeen = true;
+      batch.timer = setTimeout(() => {
+        this.flushLeaderFillBatch(batchKey).catch(error =>
+          console.error("copier final fill flush failed", this.connection.id, error instanceof Error ? error.message : String(error))
+        );
+      }, 0);
+      batch.timer.unref?.();
+      return;
+    }
+
     const age = now - batch.firstSeenAt;
-    const wait = age >= COPIER_FILL_BURST_MAX_MS
+    const wait = age >= COPIER_PARTIAL_FILL_MAX_MS
       ? 0
-      : Math.min(COPIER_FILL_BURST_QUIET_MS, Math.max(0, COPIER_FILL_BURST_MAX_MS - age));
+      : Math.min(COPIER_PARTIAL_FILL_QUIET_MS, Math.max(0, COPIER_PARTIAL_FILL_MAX_MS - age));
     batch.timer = setTimeout(() => {
       this.flushLeaderFillBatch(batchKey).catch(error =>
-        console.error("copier fill batch flush failed", this.connection.id, error instanceof Error ? error.message : String(error))
+        console.error("copier partial fill batch flush failed", this.connection.id, error instanceof Error ? error.message : String(error))
       );
     }, wait);
     batch.timer.unref?.();
   }
 
-  async routeLeaderFillToFollowers({ group, leaderEvent, providerFillId, symbol, action, quantity, contractId }) {
-    if (asText(group.mode).trim().toLowerCase() !== "live" || !group.armed) return;
-    const { data: followers, error: followerError } = await supabase.from("copier_followers")
-      .select("id,group_id,owner_id,account_id,enabled,multiplier,max_qty,max_daily_loss,allowed_symbols")
-      .eq("group_id", group.id)
-      .eq("owner_id", this.connection.owner_id)
-      .eq("enabled", true);
-    if (followerError) throw followerError;
-    if (!followers?.length) return;
-
-    const followerAccountIds = followers.map(row => row.account_id).filter(Boolean);
-    const { data: followerAccounts, error: accountError } = await supabase.from("accounts")
-      .select("id,name,external_id,source_connection_id,status,is_archived")
-      .in("id", followerAccountIds);
-    if (accountError) throw accountError;
-    const accountById = new Map((followerAccounts || []).map(row => [row.id, row]));
-
-    const activeRoutes = followers.map(follower => {
-      const followerAccount = accountById.get(follower.account_id);
-      if (!followerAccount || followerAccount.is_archived || asText(followerAccount.status).toLowerCase() !== "active") return null;
-      return { follower, followerAccount };
-    }).filter(Boolean);
-
-    const startedAt = Date.now();
-    const results = await Promise.allSettled(activeRoutes.map(({ follower, followerAccount }) =>
-      this.executeFollowerOrder({
-        group, follower, followerAccount, leaderEvent, symbol, action, quantity, providerFillId, contractId,
-      })
-    ));
-
-    const rejected = results.filter(result => result.status === "rejected");
-    if (rejected.length) {
-      console.error("copier parallel follower batch had errors", {
-        connection_id: this.connection.id,
-        group_id: group.id,
-        provider_fill_id: providerFillId,
-        followers: activeRoutes.length,
-        rejected: rejected.length,
-        elapsed_ms: Date.now() - startedAt,
-      });
-    } else {
-      console.log("copier parallel follower batch complete", {
-        connection_id: this.connection.id,
-        group_id: group.id,
-        provider_fill_id: providerFillId,
-        followers: activeRoutes.length,
-        elapsed_ms: Date.now() - startedAt,
-      });
-    }
-  }
-
   async detectLeaderExecution(report, eventType) {
+    const workerReceivedAtMs = num(report?.workerReceivedAtMs, Date.now());
     const reportId = normaliseProviderId(report?.id);
     const providerAccountId = normaliseProviderId(report?.accountId);
     const contractId = normaliseProviderId(report?.contractId);
@@ -820,116 +990,45 @@ class LiveSession {
     this.copierEventInFlight.add(inFlightKey);
 
     try {
-      const { data: link, error: linkError } = await supabase
-        .from("provider_account_links")
-        .select("account_id,provider_account_id")
-        .eq("connection_id", this.connection.id)
-        .eq("provider_account_id", providerAccountId)
-        .maybeSingle();
-      if (linkError) throw linkError;
-
-      let localAccountId = link?.account_id || null;
-      if (!localAccountId) {
-        const { data: fallbackAccount, error: fallbackError } = await supabase
-          .from("accounts")
-          .select("id")
-          .eq("owner_id", this.connection.owner_id)
-          .eq("external_id", providerAccountId)
-          .eq("is_archived", false)
-          .maybeSingle();
-        if (fallbackError) throw fallbackError;
-        localAccountId = fallbackAccount?.id || null;
-      }
-      if (!localAccountId) return;
-
-      const { data: groups, error: groupError } = await supabase
-        .from("copier_groups")
-        .select("id,owner_id,name,mode,armed,leader_account_id,max_leader_qty,allowed_symbols")
-        .eq("owner_id", this.connection.owner_id)
-        .eq("leader_account_id", localAccountId)
-        .eq("armed", true);
-      if (groupError) throw groupError;
-      if (!groups?.length) return;
-
       const sourceEntityType = asText(report?.sourceEntityType || eventType).trim().toLowerCase();
       if (sourceEntityType !== "position-delta") this.rememberPrimaryLeaderFill(report);
 
       const symbol = await this.resolveContractName(contractId);
       const providerFillId = normaliseProviderId(report?.execRefId || report?.id);
       const providerOrderId = normaliseProviderId(report?.orderId);
-      const timestamp = asText(report?.timestamp).trim() || nowIso();
+      const timestamp = providerTimestamp || nowIso();
+      const finalFill = ordStatus === "filled" || execType === "completed";
 
-      for (const group of groups) {
-        const symbolBlocked = !symbolAllowed(symbol, group.allowed_symbols);
-        const quantityBlocked = quantity > Math.max(1, num(group.max_leader_qty, 1));
-        const status = symbolBlocked || quantityBlocked ? "blocked" : "success";
-        const reason = symbolBlocked
-          ? `${symbol || `Contract ${contractId}`} is not allowed by this copier group`
-          : quantityBlocked
-            ? `Leader fill quantity ${quantity} exceeds copier max ${Math.max(1, num(group.max_leader_qty, 1))}`
-            : null;
-        const message = reason
-          ? `LIVE LEADER FILL BLOCKED · ${reason}`
-          : `LIVE LEADER FILL DETECTED · ${action || "Trade"} ${quantity} ${symbol || `Contract ${contractId}`}`;
-        const dedupeKey = `live:${this.connection.id}:fill:${providerFillId || reportId}:group:${group.id}`;
+      console.log("copier leader fill detected", {
+        connection_id: this.connection.id,
+        provider_account_id: providerAccountId,
+        action,
+        quantity,
+        symbol: symbol || null,
+        report_id: reportId,
+        provider_order_id: providerOrderId || null,
+        final_fill: finalFill,
+        provider_to_worker_ms: providerTimestampMs ? Math.max(0, workerReceivedAtMs - providerTimestampMs) : null,
+      });
 
-        const { error: insertError } = await supabase.from("copier_events").insert({
-          owner_id: this.connection.owner_id,
-          group_id: group.id,
-          leader_account_id: localAccountId,
-          event_type: "live_leader_fill_detected",
-          status,
-          dedupe_key: dedupeKey,
-          provider_order_id: providerOrderId || null,
-          provider_fill_id: providerFillId || reportId,
-          symbol: symbol || null,
-          action: action || null,
-          quantity,
-          message,
-          payload: {
-            stage: "detection_only",
-            execution_enabled: false,
-            connection_id: this.connection.id,
-            provider_account_id: providerAccountId,
-            contract_id: contractId || null,
-            execution_report_id: reportId,
-            event_type: eventType || null,
-            provider_timestamp: timestamp,
-            last_price: num(report?.lastPx, null),
-            avg_price: num(report?.avgPx, null),
-            raw_execution_report: report,
-          },
-          created_at: timestamp,
-        });
-
-        if (insertError && insertError.code !== "23505") throw insertError;
-
-        if (!insertError) {
-          console.log("copier leader fill detected", {
-            connection_id: this.connection.id,
-            group_id: group.id,
-            leader_account_id: localAccountId,
-            provider_account_id: providerAccountId,
-            action,
-            quantity,
-            symbol: symbol || null,
-            report_id: reportId,
-          });
-
-          if (status === "success") {
-            this.enqueueLeaderFillBatch({
-              group,
-              leaderEvent: { id: reportId, timestamp, source_entity_type: sourceEntityType },
-              providerFillId: providerFillId || reportId,
-              providerOrderId,
-              symbol: symbol || `Contract ${contractId}`,
-              action,
-              quantity,
-              contractId,
-            });
-          }
-        }
-      }
+      this.enqueueLeaderFillBatch({
+        providerAccountId,
+        leaderEvent: { id: reportId, timestamp, source_entity_type: sourceEntityType },
+        providerFillId: providerFillId || reportId,
+        providerOrderId,
+        symbol: symbol || `Contract ${contractId}`,
+        action,
+        quantity,
+        contractId,
+        eventType,
+        finalFill,
+        telemetry: {
+          providerTimestampMs: Number.isFinite(providerTimestampMs) ? providerTimestampMs : 0,
+          workerReceivedAtMs,
+          lastPrice: num(report?.lastPx, null),
+          avgPrice: num(report?.avgPx, null),
+        },
+      });
     } catch (error) {
       console.error("copier leader detection failed", this.connection.id, error instanceof Error ? error.message : String(error));
     } finally {
@@ -968,7 +1067,7 @@ class LiveSession {
       accountId: providerAccountId,
       contractId,
       execType: "Trade",
-      ordStatus: "Filled",
+      ordStatus: asText(fill?.ordStatus || order?.ordStatus).trim() || "Working",
       action,
       lastQty: quantity,
       orderId,
@@ -977,21 +1076,27 @@ class LiveSession {
       lastPx: num(fill?.price, null),
       avgPx: num(fill?.price, null),
       sourceEntityType: "fill",
+      workerReceivedAtMs: num(fill?.workerReceivedAtMs, Date.now()),
       rawFill: fill,
     }, eventType || "fill");
   }
 
   handleCopierFrame(frame) {
+    const frameReceivedAtMs = Date.now();
     for (const detail of propsEvents(frame)) {
       const entityType = asText(detail?.entityType).trim().toLowerCase();
       const eventType = asText(detail?.eventType).trim();
-      if (!["executionreport", "fill"].includes(entityType)) continue;
       const entities = Array.isArray(detail?.entity) ? detail.entity : [detail?.entity];
       for (const entity of entities) {
         if (!entity || typeof entity !== "object") continue;
+
+        if (entity?.contractId) this.primeContractName(entity.contractId);
+
+        if (!["executionreport", "fill"].includes(entityType)) continue;
+        const enriched = { ...entity, workerReceivedAtMs: frameReceivedAtMs };
         const handler = entityType === "fill"
-          ? this.detectLeaderFill(entity, eventType)
-          : this.detectLeaderExecution(entity, eventType);
+          ? this.detectLeaderFill(enriched, eventType)
+          : this.detectLeaderExecution(enriched, eventType);
         handler.catch(error =>
           console.error("copier frame handler failed", this.connection.id, entityType, error instanceof Error ? error.message : String(error))
         );
@@ -1040,13 +1145,12 @@ class LiveSession {
         const action = asText(fill?.action || order?.action).trim();
         const quantity = Math.abs(num(fill?.qty, num(fill?.quantity)));
         if (!providerAccountId || !contractId || quantity < 1) continue;
-
         await this.detectLeaderExecution({
           id: fillId,
           accountId: providerAccountId,
           contractId,
           execType: "Trade",
-          ordStatus: "Filled",
+          ordStatus: asText(order?.ordStatus).trim() || "Working",
           action,
           lastQty: quantity,
           orderId,
@@ -1055,6 +1159,7 @@ class LiveSession {
           lastPx: num(fill?.price, null),
           avgPx: num(fill?.price, null),
           sourceEntityType: "fill-list-fallback",
+          workerReceivedAtMs: Date.now(),
           scanReason: reason,
           rawFill: fill,
           rawOrder: order,
@@ -1068,12 +1173,10 @@ class LiveSession {
   async scanLeaderPositions(reason = "periodic-position-scan") {
     if (this.copierPositionScanInFlight || !this.accessToken || !this.subscribed) return;
     this.copierPositionScanInFlight = true;
-
     try {
       const positionsPayload = await tradovateGet(this.environment, "/position/list", this.accessToken);
       const positions = Array.isArray(positionsPayload) ? positionsPayload : [];
       const current = new Map();
-
       for (const row of positions) {
         const accountId = normaliseProviderId(row?.accountId);
         const contractId = normaliseProviderId(row?.contractId);
@@ -1100,17 +1203,8 @@ class LiveSession {
 
       const keys = new Set([...this.copierPositionSnapshot.keys(), ...current.keys()]);
       for (const key of keys) {
-        const before = this.copierPositionSnapshot.get(key) || {
-          accountId: key.split(":")[0],
-          contractId: key.split(":")[1],
-          netPos: 0,
-        };
-        const after = current.get(key) || {
-          accountId: before.accountId,
-          contractId: before.contractId,
-          netPos: 0,
-        };
-
+        const before = this.copierPositionSnapshot.get(key) || { accountId: key.split(":")[0], contractId: key.split(":")[1], netPos: 0 };
+        const after = current.get(key) || { accountId: before.accountId, contractId: before.contractId, netPos: 0 };
         const delta = num(after.netPos) - num(before.netPos);
         if (!delta) continue;
 
@@ -1118,7 +1212,6 @@ class LiveSession {
         const quantity = Math.abs(delta);
         const positionTimestamp = asText(after.raw?.timestamp).trim() || nowIso();
         const eventId = `pos-${after.accountId}-${after.contractId}-${num(before.netPos)}-${num(after.netPos)}-${Date.now()}`;
-
         this.queuePositionDeltaFallback({
           id: eventId,
           accountId: after.accountId,
@@ -1150,17 +1243,14 @@ class LiveSession {
     if (this.copierPositionScanInterval) clearInterval(this.copierPositionScanInterval);
     this.copierPositionInitialized = false;
     this.copierPositionSnapshot = new Map();
-
     this.scanLeaderPositions("initial-position-baseline").catch(error =>
       console.error("initial copier position scan failed", this.connection.id, error instanceof Error ? error.message : String(error))
     );
-
     this.copierPositionScanInterval = setInterval(() => {
       this.scanLeaderPositions("periodic-position-scan").catch(error =>
         console.error("periodic copier position scan failed", this.connection.id, error instanceof Error ? error.message : String(error))
       );
     }, Math.max(500, COPIER_POSITION_SCAN_MS));
-
     this.copierPositionScanInterval.unref?.();
   }
 
@@ -1168,20 +1258,10 @@ class LiveSession {
     this.authorized = false;
     this.subscribed = false;
     this.lastCloseInfo = "";
-
-    const {
-      token,
-      userIds,
-      accountIds,
-      accountSpec,
-      environment,
-      wsUrl: brokeredWsUrl,
-    } = await this.loadCredential();
-
+    const { token, userIds, accountIds, accountSpec, environment, wsUrl: brokeredWsUrl } = await this.loadCredential();
     this.accessToken = token;
     this.accountSpec = accountSpec || "";
     this.environment = environment;
-
     const wsUrl = brokeredWsUrl || `wss://${environment}.tradovateapi.com/v1/websocket`;
 
     await writeStatus(this.connection, {
@@ -1199,43 +1279,31 @@ class LiveSession {
       const finishReject = error => {
         if (!settled) {
           settled = true;
-          try {
-            ws.close(1011, "connection-failed");
-          } catch {}
+          try { ws.close(1011, "connection-failed"); } catch {}
           reject(error);
         }
       };
 
       const sendSocketHeartbeat = () => {
         if (ws.readyState !== WebSocket.OPEN) return;
-
         try {
           ws.send("[]");
           this.lastClientHeartbeatAt = Date.now();
         } catch (error) {
-          console.error(
-            "Tradovate heartbeat send failed",
-            this.connection.id,
-            error instanceof Error ? error.message : String(error)
-          );
+          console.error("Tradovate heartbeat send failed", this.connection.id, error instanceof Error ? error.message : String(error));
         }
       };
 
       ws.on("open", () => {
         sendRequest(ws, "authorize", 0, token);
-        this.socketHeartbeatTimer = setInterval(
-          sendSocketHeartbeat,
-          TRADOVATE_HEARTBEAT_MS
-        );
+        this.socketHeartbeatTimer = setInterval(sendSocketHeartbeat, TRADOVATE_HEARTBEAT_MS);
       });
 
       ws.on("message", async raw => {
         const rawText = asText(raw);
 
         if (rawText === "h") {
-          if (Date.now() - this.lastClientHeartbeatAt >= 1000) {
-            sendSocketHeartbeat();
-          }
+          if (Date.now() - this.lastClientHeartbeatAt >= 1000) sendSocketHeartbeat();
           return;
         }
 
@@ -1245,18 +1313,10 @@ class LiveSession {
         for (const frame of frames) {
           if (Number(frame.i) === 0) {
             if (Number(frame.s) !== 200) {
-              return finishReject(
-                new Error(
-                  `websocket authorize: ${frameError(
-                    frame,
-                    "Tradovate WebSocket authorization failed"
-                  )}`
-                )
-              );
+              return finishReject(new Error(`websocket authorize: ${frameError(frame, "Tradovate WebSocket authorization failed")}`));
             }
 
             this.authorized = true;
-
             const syncBody = accountIds?.length
               ? {
                   accounts: accountIds,
@@ -1275,60 +1335,45 @@ class LiveSession {
                     "position",
                   ],
                 }
-              : {
-                  users: userIds,
-                  splitResponses: true,
-                };
+              : { users: userIds, splitResponses: true };
 
             sendRequest(ws, "user/syncrequest", 1, syncBody);
             continue;
           }
 
           if (Number(frame.i) === 1 && Number(frame.s) >= 400) {
-            return finishReject(
-              new Error(
-                `user/syncrequest: ${frameError(
-                  frame,
-                  "Tradovate user synchronization failed"
-                )}`
-              )
-            );
+            return finishReject(new Error(`user/syncrequest: ${frameError(frame, "Tradovate user synchronization failed")}`));
           }
 
-          if (
-            Number(frame.i) === 1 &&
-            Number(frame.s) === 200 &&
-            !this.subscribed
-          ) {
+          if (Number(frame.i) === 1 && Number(frame.s) === 200 && !this.subscribed) {
             this.subscribed = true;
             this.backoffMs = 1000;
 
-            await supabase
-              .from("provider_sync_checkpoints")
-              .upsert(
-                {
-                  connection_id: this.connection.id,
-                  checkpoint_key: "copier_worker_version",
-                  checkpoint_value: VERSION,
-                  metadata: {
-                    worker_instance: INSTANCE_ID,
-                    detection_mode:
-                      "primary-fill-burst-aggregate-with-delayed-position-fallback",
-                    follower_execution_enabled: true,
-                    execution_gate:
-                      "copier_groups.mode=live + armed + follower.enabled",
-                    provider_order_mode: "market-isAutomated",
-                    follower_dispatch_mode: "parallel",
-                    partial_fill_mode: "burst-aggregate",
-                    partial_fill_quiet_ms: COPIER_FILL_BURST_QUIET_MS,
-                    partial_fill_max_ms: COPIER_FILL_BURST_MAX_MS,
-                  },
-                  updated_at: nowIso(),
-                },
-                {
-                  onConflict: "connection_id,checkpoint_key",
-                }
-              );
+            await supabase.from("provider_sync_checkpoints").upsert({
+              connection_id: this.connection.id,
+              checkpoint_key: "copier_worker_version",
+              checkpoint_value: VERSION,
+              metadata: {
+                worker_instance: INSTANCE_ID,
+                detection_mode: "fast-rpc-dispatch-with-delayed-position-fallback",
+                follower_execution_enabled: true,
+                execution_gate: "atomic prepare_live_copier_dispatch_v1 + follower.enabled",
+                provider_order_mode: "market-isAutomated",
+                follower_dispatch_mode: "parallel-fast-path",
+                dispatch_preflight: "single-supabase-rpc",
+                audit_mode: "async-after-dispatch-reservation",
+                latency_telemetry: true,
+                partial_fill_mode: "final-fill-immediate-partial-burst",
+                partial_fill_quiet_ms: COPIER_PARTIAL_FILL_QUIET_MS,
+                partial_fill_max_ms: COPIER_PARTIAL_FILL_MAX_MS,
+                emergency_flatten_enabled: true,
+                emergency_flatten_endpoint: "order/liquidateposition",
+                emergency_command_poll_ms: COPIER_COMMAND_POLL_MS,
+                safety_disarm_on_execution_error: true,
+                rest_fallback_delay_ms: COPIER_REST_FALLBACK_DELAY_MS,
+              },
+              updated_at: nowIso(),
+            }, { onConflict: "connection_id,checkpoint_key" });
 
             await writeStatus(this.connection, {
               state: "live",
@@ -1344,20 +1389,12 @@ class LiveSession {
             this.scheduleCopierFillScan("initial-live-snapshot", 500);
             this.startCopierPositionScanner();
 
-            if (this.sessionRefreshTimer) {
-              clearTimeout(this.sessionRefreshTimer);
-            }
+            if (this.sessionRefreshTimer) clearTimeout(this.sessionRefreshTimer);
 
             this.sessionRefreshTimer = setTimeout(() => {
               if (this.ws?.readyState === WebSocket.OPEN) {
-                console.log(
-                  "scheduled Tradovate token refresh reconnect",
-                  this.connection.id
-                );
-
-                try {
-                  this.ws.close(1000, "scheduled-token-refresh");
-                } catch {}
+                console.log("scheduled Tradovate token refresh reconnect", this.connection.id);
+                try { this.ws.close(1000, "scheduled-token-refresh"); } catch {}
               }
             }, SESSION_RECONNECT_MS);
 
@@ -1373,19 +1410,20 @@ class LiveSession {
 
           if (this.authorized) {
             this.handleCopierFrame(frame);
-            this.scheduleCopierFillScan("tradovate-user-event", 120);
-
+            this.scheduleCopierFillScan("tradovate-user-event", COPIER_REST_FALLBACK_DELAY_MS);
             this.eventCount += 1;
             const eventAt = nowIso();
 
-            await writeStatus(this.connection, {
+            writeStatus(this.connection, {
               state: "live",
               last_event_at: eventAt,
               last_heartbeat_at: eventAt,
               event_count: this.eventCount,
               reconnect_count: this.reconnectCount,
               last_error: null,
-            });
+            }).catch(error =>
+              console.error("event status update failed", this.connection.id, error instanceof Error ? error.message : String(error))
+            );
 
             this.schedulePulse("tradovate-user-event");
           }
@@ -1395,20 +1433,14 @@ class LiveSession {
       ws.on("error", finishReject);
 
       ws.on("close", (code, reason) => {
-        this.lastCloseInfo =
-          `Tradovate WebSocket closed (${code}) ${asText(reason)}`.trim();
-
+        this.lastCloseInfo = `Tradovate WebSocket closed (${code}) ${asText(reason)}`.trim();
         this.clearHeartbeat();
         this.authorized = false;
         this.subscribed = false;
         this.ws = null;
 
         if (!this.stopped && !stopping) {
-          finishReject(
-            new Error(
-              `Tradovate WebSocket closed (${code}) ${asText(reason)}`.trim()
-            )
-          );
+          finishReject(new Error(`Tradovate WebSocket closed (${code}) ${asText(reason)}`.trim()));
         } else if (!settled) {
           settled = true;
           resolve();
@@ -1426,18 +1458,12 @@ class LiveSession {
       }, HEARTBEAT_MS);
     });
 
-    while (
-      !this.stopped &&
-      !stopping &&
-      this.ws?.readyState === WebSocket.OPEN
-    ) {
+    while (!this.stopped && !stopping && this.ws?.readyState === WebSocket.OPEN) {
       await sleep(1000);
     }
 
     if (!this.stopped && !stopping) {
-      throw new Error(
-        this.lastCloseInfo || "Tradovate WebSocket disconnected"
-      );
+      throw new Error(this.lastCloseInfo || "Tradovate WebSocket disconnected");
     }
   }
 
@@ -1446,14 +1472,9 @@ class LiveSession {
     if (this.socketHeartbeatTimer) clearInterval(this.socketHeartbeatTimer);
     if (this.sessionRefreshTimer) clearTimeout(this.sessionRefreshTimer);
     if (this.copierFillScanTimer) clearTimeout(this.copierFillScanTimer);
-    if (this.copierPositionScanInterval) {
-      clearInterval(this.copierPositionScanInterval);
-    }
+    if (this.copierPositionScanInterval) clearInterval(this.copierPositionScanInterval);
 
-    for (const timer of this.pendingPositionFallbacks.values()) {
-      clearTimeout(timer);
-    }
-
+    for (const timer of this.pendingPositionFallbacks.values()) clearTimeout(timer);
     for (const batch of this.pendingLeaderFillBatches.values()) {
       if (batch?.timer) clearTimeout(batch.timer);
     }
@@ -1461,6 +1482,7 @@ class LiveSession {
     this.pendingLeaderFillBatches.clear();
     this.pendingPositionFallbacks.clear();
     this.recentPrimaryLeaderFills.clear();
+    this.contractNamePromiseCache.clear();
 
     this.heartbeatTimer = null;
     this.socketHeartbeatTimer = null;
@@ -1473,22 +1495,10 @@ class LiveSession {
 
   schedulePulse(reason, delay = PULSE_MIN_INTERVAL_MS) {
     if (this.stopped || stopping) return;
-
-    if (this.pulseTimer) {
-      clearTimeout(this.pulseTimer);
-    }
-
+    if (this.pulseTimer) clearTimeout(this.pulseTimer);
     const sinceLast = Date.now() - this.lastPulseAt;
-    const wait = Math.max(
-      delay,
-      PULSE_MIN_INTERVAL_MS - sinceLast,
-      0
-    );
-
-    this.pulseTimer = setTimeout(
-      () => this.runPulse(reason),
-      wait
-    );
+    const wait = Math.max(delay, PULSE_MIN_INTERVAL_MS - sinceLast, 0);
+    this.pulseTimer = setTimeout(() => this.runPulse(reason), wait);
   }
 
   async runPulse(reason) {
@@ -1503,29 +1513,24 @@ class LiveSession {
     this.lastPulseAt = Date.now();
 
     try {
-      const response = await fetch(
-        `${SUPABASE_URL}/functions/v1/tradovate-live-pulse`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${SERVICE_ROLE_KEY}`,
-            "apikey": SERVICE_ROLE_KEY,
-            "x-fra-worker-secret": WORKER_SECRET,
-          },
-          body: JSON.stringify({
-            connection_id: this.connection.id,
-            reason,
-          }),
-        }
-      );
+      const response = await fetch(`${SUPABASE_URL}/functions/v1/tradovate-live-pulse`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${SERVICE_ROLE_KEY}`,
+          "apikey": SERVICE_ROLE_KEY,
+          "x-fra-worker-secret": WORKER_SECRET,
+        },
+        body: JSON.stringify({
+          connection_id: this.connection.id,
+          reason,
+        }),
+      });
 
       const payload = await response.json().catch(() => ({}));
 
       if (!response.ok || payload?.error) {
-        throw new Error(
-          payload?.error || `Live pulse failed (${response.status})`
-        );
+        throw new Error(payload?.error || `Live pulse failed (${response.status})`);
       }
 
       this.pulseCount += 1;
@@ -1546,14 +1551,9 @@ class LiveSession {
         },
       });
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : String(error);
+      const message = error instanceof Error ? error.message : String(error);
 
-      console.error(
-        "live pulse failed",
-        this.connection.id,
-        message
-      );
+      console.error("live pulse failed", this.connection.id, message);
 
       await writeStatus(this.connection, {
         state: "attention",
@@ -1567,10 +1567,7 @@ class LiveSession {
 
       if (this.pulseQueued) {
         this.pulseQueued = false;
-        this.schedulePulse(
-          "queued-provider-event",
-          350
-        );
+        this.schedulePulse("queued-provider-event", 350);
       }
     }
   }
@@ -1578,9 +1575,7 @@ class LiveSession {
   async stop(reason = "stopped") {
     this.stopped = true;
 
-    if (this.pulseTimer) {
-      clearTimeout(this.pulseTimer);
-    }
+    if (this.pulseTimer) clearTimeout(this.pulseTimer);
 
     this.clearHeartbeat();
 
@@ -1591,23 +1586,761 @@ class LiveSession {
     this.ws = null;
 
     await writeStatus(this.connection, {
-      state: reason === "not-eligible"
-        ? "manual"
-        : "offline",
+      state: reason === "not-eligible" ? "manual" : "offline",
       last_heartbeat_at: nowIso(),
-      last_error:
-        reason === "not-eligible"
-          ? "Live sync is available on paid plans"
-          : null,
+      last_error: reason === "not-eligible"
+        ? "Live sync is available on paid plans"
+        : null,
     });
+  }
+}
+
+const OPEN_ORDER_STATUSES = new Set([
+  "working",
+  "pendingnew",
+  "pendingreplace",
+  "pendingcancel",
+  "suspended",
+  "unknown",
+]);
+
+function isOpenTradovateOrder(order) {
+  const status = asText(order?.ordStatus).trim().toLowerCase();
+  return OPEN_ORDER_STATUSES.has(status);
+}
+
+function normalizeFlattenTargets(command) {
+  const rawTargets = Array.isArray(command?.payload?.targets)
+    ? command.payload.targets
+    : [];
+
+  const seen = new Set();
+  const targets = [];
+
+  for (const row of rawTargets) {
+    const accountId = asText(row?.account_id).trim();
+    const connectionId = asText(row?.source_connection_id).trim();
+    const providerAccountId = normaliseProviderId(row?.provider_account_id);
+
+    if (!accountId || !connectionId || !providerAccountId) continue;
+
+    const key = `${connectionId}:${providerAccountId}`;
+    if (seen.has(key)) continue;
+
+    seen.add(key);
+
+    targets.push({
+      account_id: accountId,
+      name: asText(row?.name).trim() || providerAccountId,
+      source_connection_id: connectionId,
+      provider_account_id: providerAccountId,
+      was_enabled: row?.was_enabled === true,
+    });
+  }
+
+  return targets;
+}
+
+async function loadFlattenTargetsFromDatabase(command) {
+  const ownerId = asText(command?.owner_id).trim();
+  const groupId = asText(command?.group_id).trim();
+  if (!ownerId || !groupId) return [];
+
+  const { data: followers, error: followerError } = await supabase
+    .from("copier_followers")
+    .select("account_id,enabled")
+    .eq("group_id", groupId)
+    .eq("owner_id", ownerId);
+
+  if (followerError) throw followerError;
+
+  const accountIds = [...new Set(
+    (followers || []).map(row => row.account_id).filter(Boolean)
+  )];
+
+  if (!accountIds.length) return [];
+
+  const { data: accounts, error: accountError } = await supabase
+    .from("accounts")
+    .select("id,name,external_id,source_connection_id,is_archived")
+    .eq("owner_id", ownerId)
+    .in("id", accountIds);
+
+  if (accountError) throw accountError;
+
+  const enabledById = new Map(
+    (followers || []).map(row => [String(row.account_id), row.enabled === true])
+  );
+
+  return (accounts || [])
+    .filter(row =>
+      !row.is_archived &&
+      row.source_connection_id &&
+      row.external_id
+    )
+    .map(row => ({
+      account_id: row.id,
+      name: asText(row.name).trim() || normaliseProviderId(row.external_id),
+      source_connection_id: asText(row.source_connection_id).trim(),
+      provider_account_id: normaliseProviderId(row.external_id),
+      was_enabled: enabledById.get(String(row.id)) === true,
+    }));
+}
+
+async function emergencyRestSession(connectionId) {
+  const live = sessions.get(connectionId);
+
+  if (live?.accessToken && live?.environment) {
+    return {
+      token: live.accessToken,
+      environment: live.environment,
+      source: "live-session",
+    };
+  }
+
+  const brokered = await requestWorkerSession(connectionId);
+
+  return {
+    token: brokered.token,
+    environment: brokered.environment,
+    source: "fresh-rest-session",
+  };
+}
+
+async function writeFlattenEvent(command, eventType, status, message, payload = {}) {
+  const dedupeKey = `flatten:${command.id}:${eventType}`;
+
+  const { error } = await supabase.from("copier_events").insert({
+    owner_id: command.owner_id,
+    group_id: command.group_id,
+    event_type: eventType,
+    status,
+    dedupe_key: dedupeKey,
+    message,
+    payload: {
+      command_id: command.id,
+      worker_instance: INSTANCE_ID,
+      worker_version: VERSION,
+      ...payload,
+    },
+  });
+
+  if (error && error.code !== "23505") {
+    console.error("flatten audit insert failed", command.id, error.message);
+  }
+}
+
+async function completeCopierCommand(command, status, result = {}, errorMessage = null) {
+  const { error } = await supabase
+    .from("copier_commands")
+    .update({
+      status,
+      result,
+      error: errorMessage,
+      completed_at: nowIso(),
+      worker_instance: INSTANCE_ID,
+    })
+    .eq("id", command.id)
+    .eq("worker_instance", INSTANCE_ID);
+
+  if (error) throw error;
+}
+
+async function forceGroupDisarmed(command) {
+  const { error } = await supabase
+    .from("copier_groups")
+    .update({
+      armed: false,
+      desired_armed: false,
+      updated_at: nowIso(),
+    })
+    .eq("id", command.group_id)
+    .eq("owner_id", command.owner_id);
+
+  if (error) throw error;
+}
+
+async function flattenConnectionTargets(command, connectionId, targets) {
+  const rest = await emergencyRestSession(connectionId);
+
+  const providerIds = new Set(
+    targets
+      .map(row => normaliseProviderId(row.provider_account_id))
+      .filter(Boolean)
+  );
+
+  const numericProviderIds = new Set(
+    [...providerIds].map(Number).filter(Number.isFinite)
+  );
+
+  const result = {
+    connection_id: connectionId,
+    session_source: rest.source,
+    environment: rest.environment,
+    account_count: targets.length,
+    cancelled_orders: 0,
+    cancel_errors: [],
+    liquidation_requests: 0,
+    liquidation_errors: [],
+    residual_positions: [],
+    residual_orders: [],
+    verification_ok: false,
+  };
+
+  let orders = [];
+
+  try {
+    const payload = await tradovateGet(
+      rest.environment,
+      "/order/list",
+      rest.token
+    );
+
+    orders = Array.isArray(payload) ? payload : [];
+  } catch (error) {
+    result.cancel_errors.push({
+      scope: "order-list",
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  const openOrders = orders.filter(order => {
+    const accountId = Number(order?.accountId);
+
+    return (
+      Number.isFinite(accountId) &&
+      numericProviderIds.has(accountId) &&
+      isOpenTradovateOrder(order) &&
+      Number(order?.id) > 0
+    );
+  });
+
+  const cancelResults = await Promise.allSettled(
+    openOrders.map(async order => {
+      await tradovatePost(
+        rest.environment,
+        "/order/cancelorder",
+        rest.token,
+        {
+          orderId: Number(order.id),
+        }
+      );
+
+      return {
+        order_id: Number(order.id),
+        account_id: Number(order.accountId),
+        contract_id: Number(order.contractId) || null,
+      };
+    })
+  );
+
+  cancelResults.forEach((entry, index) => {
+    if (entry.status === "fulfilled") {
+      result.cancelled_orders += 1;
+    } else {
+      result.cancel_errors.push({
+        order_id: Number(openOrders[index]?.id) || null,
+        error: entry.reason instanceof Error
+          ? entry.reason.message
+          : String(entry.reason),
+      });
+    }
+  });
+
+  const liquidationStates = new Set();
+
+  const submitLiquidation = async position => {
+    const accountId = Number(position?.accountId);
+    const contractId = Number(position?.contractId);
+    const netPos = num(
+      position?.netPos,
+      num(position?.netPosition, 0)
+    );
+
+    if (
+      !Number.isFinite(accountId) ||
+      !Number.isFinite(contractId) ||
+      !contractId ||
+      !netPos
+    ) {
+      return;
+    }
+
+    const stateKey =
+      `${accountId}:${contractId}:${Math.sign(netPos)}:${Math.abs(netPos)}`;
+
+    if (liquidationStates.has(stateKey)) return;
+
+    liquidationStates.add(stateKey);
+
+    try {
+      const response = await tradovatePost(
+        rest.environment,
+        "/order/liquidateposition",
+        rest.token,
+        {
+          accountId,
+          contractId,
+          admin: false,
+          isAutomated: true,
+          customTag50:
+            `FRA-FLAT-${asText(command.id).slice(0, 8)}`,
+        }
+      );
+
+      result.liquidation_requests += 1;
+      return response;
+    } catch (error) {
+      result.liquidation_errors.push({
+        account_id: accountId,
+        contract_id: contractId,
+        net_position: netPos,
+        error: error instanceof Error
+          ? error.message
+          : String(error),
+      });
+    }
+  };
+
+  let positions = [];
+
+  try {
+    const payload = await tradovateGet(
+      rest.environment,
+      "/position/list",
+      rest.token
+    );
+
+    positions = Array.isArray(payload) ? payload : [];
+  } catch (error) {
+    result.liquidation_errors.push({
+      scope: "position-list",
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  const initialOpenPositions = positions.filter(position => {
+    const accountId = Number(position?.accountId);
+    const netPos = num(
+      position?.netPos,
+      num(position?.netPosition, 0)
+    );
+
+    return (
+      Number.isFinite(accountId) &&
+      numericProviderIds.has(accountId) &&
+      netPos !== 0
+    );
+  });
+
+  await Promise.allSettled(
+    initialOpenPositions.map(submitLiquidation)
+  );
+
+  let finalPositions = initialOpenPositions;
+  let finalOrders = openOrders;
+
+  for (
+    let attempt = 0;
+    attempt < COPIER_FLATTEN_VERIFY_ATTEMPTS;
+    attempt += 1
+  ) {
+    await sleep(COPIER_FLATTEN_VERIFY_MS);
+
+    const [positionResult, orderResult] =
+      await Promise.allSettled([
+        tradovateGet(
+          rest.environment,
+          "/position/list",
+          rest.token
+        ),
+        tradovateGet(
+          rest.environment,
+          "/order/list",
+          rest.token
+        ),
+      ]);
+
+    if (positionResult.status === "fulfilled") {
+      const rows = Array.isArray(positionResult.value)
+        ? positionResult.value
+        : [];
+
+      finalPositions = rows.filter(position => {
+        const accountId = Number(position?.accountId);
+        const netPos = num(
+          position?.netPos,
+          num(position?.netPosition, 0)
+        );
+
+        return (
+          Number.isFinite(accountId) &&
+          numericProviderIds.has(accountId) &&
+          netPos !== 0
+        );
+      });
+    }
+
+    if (orderResult.status === "fulfilled") {
+      const rows = Array.isArray(orderResult.value)
+        ? orderResult.value
+        : [];
+
+      finalOrders = rows.filter(order => {
+        const accountId = Number(order?.accountId);
+
+        return (
+          Number.isFinite(accountId) &&
+          numericProviderIds.has(accountId) &&
+          isOpenTradovateOrder(order) &&
+          Number(order?.id) > 0
+        );
+      });
+    }
+
+    if (
+      positionResult.status === "fulfilled" &&
+      orderResult.status === "fulfilled" &&
+      !finalPositions.length &&
+      !finalOrders.length
+    ) {
+      result.verification_ok = true;
+      break;
+    }
+
+    if (finalOrders.length) {
+      await Promise.allSettled(
+        finalOrders.map(async order => {
+          try {
+            await tradovatePost(
+              rest.environment,
+              "/order/cancelorder",
+              rest.token,
+              {
+                orderId: Number(order.id),
+              }
+            );
+          } catch {}
+        })
+      );
+    }
+
+    if (finalPositions.length && attempt >= 1) {
+      await Promise.allSettled(
+        finalPositions.map(submitLiquidation)
+      );
+    }
+  }
+
+  result.residual_positions =
+    finalPositions.map(position => ({
+      account_id: Number(position?.accountId) || null,
+      contract_id: Number(position?.contractId) || null,
+      net_position: num(
+        position?.netPos,
+        num(position?.netPosition, 0)
+      ),
+    }));
+
+  result.residual_orders =
+    finalOrders.map(order => ({
+      order_id: Number(order?.id) || null,
+      account_id: Number(order?.accountId) || null,
+      contract_id: Number(order?.contractId) || null,
+      status: asText(order?.ordStatus).trim() || null,
+    }));
+
+  return result;
+}
+
+async function processFlattenCommand(command) {
+  const startedAt = Date.now();
+
+  await forceGroupDisarmed(command);
+
+  await writeFlattenEvent(
+    command,
+    "flatten_started",
+    "pending",
+    "EMERGENCY FLATTEN STARTED · all configured followers are being checked",
+    {
+      requested_at: command.requested_at || null,
+    }
+  );
+
+  let targets = normalizeFlattenTargets(command);
+
+  if (!targets.length) {
+    targets = await loadFlattenTargetsFromDatabase(command);
+  }
+
+  if (!targets.length) {
+    const result = {
+      ok: true,
+      target_count: 0,
+      connection_results: [],
+      elapsed_ms: Date.now() - startedAt,
+    };
+
+    await completeCopierCommand(
+      command,
+      "success",
+      result,
+      null
+    );
+
+    await writeFlattenEvent(
+      command,
+      "flatten_completed",
+      "success",
+      "EMERGENCY FLATTEN COMPLETE · no configured follower accounts to close",
+      result
+    );
+
+    return;
+  }
+
+  const byConnection = new Map();
+
+  for (const target of targets) {
+    const key = target.source_connection_id;
+    const list = byConnection.get(key) || [];
+    list.push(target);
+    byConnection.set(key, list);
+  }
+
+  const entries = [...byConnection.entries()];
+
+  const settled = await Promise.allSettled(
+    entries.map(([connectionId, connectionTargets]) =>
+      flattenConnectionTargets(
+        command,
+        connectionId,
+        connectionTargets
+      )
+    )
+  );
+
+  const connectionResults =
+    settled.map((entry, index) => {
+      const connectionId = entries[index][0];
+
+      if (entry.status === "fulfilled") {
+        return entry.value;
+      }
+
+      return {
+        connection_id: connectionId,
+        account_count:
+          byConnection.get(connectionId)?.length || 0,
+        fatal_error:
+          entry.reason instanceof Error
+            ? entry.reason.message
+            : String(entry.reason),
+        residual_positions: [],
+        residual_orders: [],
+        verification_ok: false,
+      };
+    });
+
+  const fatalCount =
+    connectionResults.filter(row => row.fatal_error).length;
+
+  const residualPositionCount =
+    connectionResults.reduce(
+      (sum, row) =>
+        sum + (row.residual_positions?.length || 0),
+      0
+    );
+
+  const residualOrderCount =
+    connectionResults.reduce(
+      (sum, row) =>
+        sum + (row.residual_orders?.length || 0),
+      0
+    );
+
+  const actionErrorCount =
+    connectionResults.reduce(
+      (sum, row) =>
+        sum +
+        (row.cancel_errors?.length || 0) +
+        (row.liquidation_errors?.length || 0),
+      0
+    );
+
+  const verificationFailureCount =
+    connectionResults.filter(
+      row => row.verification_ok !== true
+    ).length;
+
+  const clean =
+    fatalCount === 0 &&
+    verificationFailureCount === 0 &&
+    residualPositionCount === 0 &&
+    residualOrderCount === 0;
+
+  const status = clean
+    ? "success"
+    : (
+      fatalCount === connectionResults.length
+        ? "error"
+        : "partial"
+    );
+
+  const result = {
+    ok: clean,
+    target_count: targets.length,
+    connection_count: byConnection.size,
+    fatal_count: fatalCount,
+    verification_failure_count:
+      verificationFailureCount,
+    action_error_count: actionErrorCount,
+    residual_position_count:
+      residualPositionCount,
+    residual_order_count:
+      residualOrderCount,
+    elapsed_ms: Date.now() - startedAt,
+    connection_results: connectionResults,
+  };
+
+  const errorMessage = clean
+    ? null
+    : `Flatten incomplete: ${residualPositionCount} open position(s), ${residualOrderCount} working order(s), ${fatalCount} unavailable connection(s), ${verificationFailureCount} unverified connection(s)`;
+
+  await completeCopierCommand(
+    command,
+    status,
+    result,
+    errorMessage
+  );
+
+  await writeFlattenEvent(
+    command,
+    clean
+      ? "flatten_completed"
+      : "flatten_attention",
+    status,
+    clean
+      ? `EMERGENCY FLATTEN COMPLETE · ${targets.length} follower account(s) checked and flat`
+      : `EMERGENCY FLATTEN NEEDS ATTENTION · ${errorMessage}`,
+    result
+  );
+}
+
+async function failCopierCommand(command, error) {
+  const message =
+    error instanceof Error
+      ? error.message
+      : String(error);
+
+  try {
+    await forceGroupDisarmed(command);
+
+    await completeCopierCommand(
+      command,
+      "error",
+      {
+        ok: false,
+        worker_version: VERSION,
+        worker_instance: INSTANCE_ID,
+      },
+      message
+    );
+
+    await writeFlattenEvent(
+      command,
+      "flatten_failed",
+      "error",
+      `EMERGENCY FLATTEN FAILED · ${message}`,
+      {
+        error: message,
+      }
+    );
+  } catch (secondaryError) {
+    console.error(
+      "unable to record failed copier command",
+      command?.id,
+      secondaryError instanceof Error
+        ? secondaryError.message
+        : String(secondaryError)
+    );
+  }
+}
+
+async function runCopierCommandPump() {
+  console.log(
+    `copier emergency command pump active · ${COPIER_COMMAND_POLL_MS}ms`
+  );
+
+  while (!stopping) {
+    try {
+      const { data, error } = await supabase.rpc(
+        "claim_copier_commands_v1",
+        {
+          p_worker_instance: INSTANCE_ID,
+          p_limit: 4,
+        }
+      );
+
+      if (error) throw error;
+
+      const commands =
+        Array.isArray(data) ? data : [];
+
+      for (const command of commands) {
+        if (stopping) break;
+
+        if (
+          asText(command?.command_type).trim() !==
+          "flatten_followers"
+        ) {
+          await completeCopierCommand(
+            command,
+            "error",
+            {
+              ok: false,
+            },
+            `Unsupported copier command: ${command?.command_type || "unknown"}`
+          );
+
+          continue;
+        }
+
+        try {
+          await processFlattenCommand(command);
+        } catch (error) {
+          console.error(
+            "copier emergency command failed",
+            command?.id,
+            error instanceof Error
+              ? error.message
+              : String(error)
+          );
+
+          await failCopierCommand(
+            command,
+            error
+          );
+        }
+      }
+    } catch (error) {
+      console.error(
+        "copier command pump failed",
+        error instanceof Error
+          ? error.message
+          : String(error)
+      );
+    }
+
+    await sleep(COPIER_COMMAND_POLL_MS);
   }
 }
 
 async function reconcileTargets() {
   const targets = await loadTargets();
-  const targetById = new Map(
-    targets.map(row => [row.id, row])
-  );
+  const targetById =
+    new Map(targets.map(row => [row.id, row]));
 
   for (const [id, session] of sessions) {
     const target = targetById.get(id);
@@ -1635,16 +2368,15 @@ async function reconcileTargets() {
     );
   }
 
-  const liveCount = [...sessions.values()].filter(
-    session =>
-      session.subscribed &&
-      session.ws?.readyState === WebSocket.OPEN
-  ).length;
+  const liveCount =
+    [...sessions.values()].filter(
+      session =>
+        session.subscribed &&
+        session.ws?.readyState === WebSocket.OPEN
+    ).length;
 
-  const connectingCount = Math.max(
-    sessions.size - liveCount,
-    0
-  );
+  const connectingCount =
+    Math.max(sessions.size - liveCount, 0);
 
   console.log(
     `[${nowIso()}] live targets=${targets.length} subscribed=${liveCount} connecting=${connectingCount}`
@@ -1661,8 +2393,8 @@ async function shutdown(signal) {
   );
 
   await Promise.allSettled(
-    [...sessions.values()].map(session =>
-      session.stop("worker-shutdown")
+    [...sessions.values()].map(
+      session => session.stop("worker-shutdown")
     )
   );
 
@@ -1681,22 +2413,31 @@ process.on(
 
 process.on(
   "unhandledRejection",
-  error => console.error(
-    "unhandled rejection",
-    error
-  )
+  error =>
+    console.error(
+      "unhandled rejection",
+      error
+    )
 );
 
 process.on(
   "uncaughtException",
-  error => console.error(
-    "uncaught exception",
-    error
-  )
+  error =>
+    console.error(
+      "uncaught exception",
+      error
+    )
 );
 
 console.log(
   `FRA Prop HQ Tradovate live worker v${VERSION} starting as ${INSTANCE_ID}`
+);
+
+runCopierCommandPump().catch(error =>
+  console.error(
+    "copier command pump stopped unexpectedly",
+    error
+  )
 );
 
 await reconcileTargets();
